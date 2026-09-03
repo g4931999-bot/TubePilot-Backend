@@ -1,11 +1,11 @@
 const express = require('express');
 const { protect } = require('../middleware/auth');
-const { generateTitle, generateDescription, generateTags, generateCaption, generateHashtags, generateAiScript, analyzeSeoScore } = require('../utils/groq');
+const { generateTitle, generateTitleOptions, generateDescription, generateDescriptionOptions, generateTags, generateCaption, generateHashtags, generateAiScript, analyzeSeoScore } = require('../utils/groq');
 
 const router = express.Router();
 
 // AI features cost diamonds (premium feature) - adjust cost as needed
-const AI_FEATURE_COST = { title: 2, description: 2, tags: 2, caption: 2, hashtags: 2, ideas: 3, seoScore: 1 };
+const AI_FEATURE_COST = { title: 2, description: 2, tags: 2, caption: 2, hashtags: 2, ideas: 3, seoScore: 1, titleOptions: 3, descriptionOptions: 3 };
 
 const chargeDiamonds = async (user, cost) => {
   if (user.diamondBalance < cost) {
@@ -32,6 +32,23 @@ router.post('/title', protect, async (req, res) => {
   }
 });
 
+// @route POST /api/ai/title-options  { topic, count? }
+// Multi-option variant for the "Generate & Select" workflow — returns
+// 3-5 distinct titles instead of one, for the option-cards UI.
+router.post('/title-options', protect, async (req, res) => {
+  try {
+    const { topic, count } = req.body;
+    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
+
+    await chargeDiamonds(req.user, AI_FEATURE_COST.titleOptions);
+    const titles = await generateTitleOptions(topic, count);
+    res.json({ success: true, titles, diamondsCharged: AI_FEATURE_COST.titleOptions, remainingDiamonds: req.user.diamondBalance });
+  } catch (err) {
+    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
+    res.status(status).json({ success: false, message: err.message });
+  }
+});
+
 // @route POST /api/ai/description  { topic }
 router.post('/description', protect, async (req, res) => {
   try {
@@ -41,6 +58,21 @@ router.post('/description', protect, async (req, res) => {
     await chargeDiamonds(req.user, AI_FEATURE_COST.description);
     const description = await generateDescription(topic);
     res.json({ success: true, description, diamondsCharged: AI_FEATURE_COST.description, remainingDiamonds: req.user.diamondBalance });
+  } catch (err) {
+    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
+    res.status(status).json({ success: false, message: err.message });
+  }
+});
+
+// @route POST /api/ai/description-options  { topic, count? }
+router.post('/description-options', protect, async (req, res) => {
+  try {
+    const { topic, count } = req.body;
+    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
+
+    await chargeDiamonds(req.user, AI_FEATURE_COST.descriptionOptions);
+    const descriptions = await generateDescriptionOptions(topic, count);
+    res.json({ success: true, descriptions, diamondsCharged: AI_FEATURE_COST.descriptionOptions, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });

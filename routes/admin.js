@@ -6,6 +6,7 @@ const Video = require('../models/Video');
 const Transaction = require('../models/Transaction');
 const PaymentSettings = require('../models/PaymentSettings');
 const Notification = require('../models/Notification');
+const GiftCode = require('../models/GiftCode');
 const { sendPushToUser } = require('../utils/push');
 const { uploadBufferToCloudinary, account1 } = require('../utils/cloudinary');
 const { deleteUserAccountCascade } = require('../utils/user');
@@ -241,6 +242,75 @@ router.delete('/users/:id', async (req, res) => {
       message: `${label}'s account and all associated data has been permanently deleted${storageNote}`,
       cloudinaryCleanup
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Gift Codes
+// ---------------------------------------------------------------------------
+
+const _randomCode = (length = 8) => {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I — avoids ambiguous codes
+  let out = '';
+  for (let i = 0; i < length; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+};
+
+// @route POST /api/admin/gift-codes  { code?, diamondValue, label?, maxRedemptions? }
+// If `code` is omitted, a random 8-character code is generated.
+router.post('/gift-codes', async (req, res) => {
+  try {
+    const { code, diamondValue, label, maxRedemptions } = req.body;
+    const value = Number(diamondValue);
+    if (![2, 3].includes(value)) {
+      return res.status(400).json({ success: false, message: 'diamondValue must be exactly 2 or 3' });
+    }
+
+    let finalCode = (code || '').trim().toUpperCase();
+    if (finalCode) {
+      const exists = await GiftCode.findOne({ code: finalCode });
+      if (exists) return res.status(409).json({ success: false, message: 'That code already exists — pick another or leave it blank to auto-generate.' });
+    } else {
+      // Regenerate on the rare collision rather than trusting one random draw.
+      do {
+        finalCode = _randomCode();
+      } while (await GiftCode.findOne({ code: finalCode }));
+    }
+
+    const giftCode = await GiftCode.create({
+      code: finalCode,
+      diamondValue: value,
+      label: label || '',
+      createdBy: req.user._id,
+      maxRedemptions: maxRedemptions ? Number(maxRedemptions) : null
+    });
+
+    res.status(201).json({ success: true, giftCode });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// @route GET /api/admin/gift-codes
+router.get('/gift-codes', async (req, res) => {
+  try {
+    const giftCodes = await GiftCode.find().sort({ createdAt: -1 }).populate('createdBy', 'name email');
+    res.json({ success: true, giftCodes });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// @route PATCH /api/admin/gift-codes/:id/toggle-active
+router.patch('/gift-codes/:id/toggle-active', async (req, res) => {
+  try {
+    const giftCode = await GiftCode.findById(req.params.id);
+    if (!giftCode) return res.status(404).json({ success: false, message: 'Gift code not found' });
+    giftCode.active = !giftCode.active;
+    await giftCode.save();
+    res.json({ success: true, giftCode });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

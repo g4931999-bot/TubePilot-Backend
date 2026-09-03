@@ -475,6 +475,55 @@ router.get('/:id', protect, async (req, res) => {
   }
 });
 
+// @route PATCH /api/videos/:id/metadata  { platform, title?, description?, caption?, hashtags? }
+// Lets the AI Title/Description generator (and SEO Optimizer) "Apply to
+// Video" flow update a queued video's metadata after upload, instead of
+// only being settable at upload time. Only allowed while that platform's
+// target is still pending/queued — once it's processing, uploaded, or
+// failed, editing metadata here wouldn't reach the destination platform
+// anyway, so it's blocked with a clear reason rather than silently no-oping.
+router.patch('/:id/metadata', protect, async (req, res) => {
+  try {
+    const { platform, title, description, caption, hashtags } = req.body;
+    if (!platform) return res.status(400).json({ success: false, message: 'platform is required' });
+
+    const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
+    if (!video) return res.status(404).json({ success: false, message: 'Video not found' });
+
+    const target = video.platforms.find((p) => p.platform === platform);
+    if (!target) return res.status(404).json({ success: false, message: `This video has no ${platform} target` });
+
+    if (!['pending', 'queued'].includes(target.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Can't edit metadata — this video's ${platform} upload is already ${target.status}.`
+      });
+    }
+
+    if (title !== undefined) {
+      target.title = title;
+      video.aiGenerated.title = true;
+    }
+    if (description !== undefined) {
+      target.description = description;
+      video.aiGenerated.description = true;
+    }
+    if (caption !== undefined) {
+      target.caption = caption;
+      video.aiGenerated.caption = true;
+    }
+    if (hashtags !== undefined) {
+      target.hashtags = Array.isArray(hashtags) ? hashtags : String(hashtags).split(',').map((h) => h.trim()).filter(Boolean);
+      video.aiGenerated.hashtags = true;
+    }
+
+    await video.save();
+    res.json({ success: true, message: 'Video updated', video });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.patch('/:id/schedule/:platform', protect, async (req, res) => {
   try {
     const { scheduledAt } = req.body;

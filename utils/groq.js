@@ -33,7 +33,13 @@ const callGroqOnce = async (apiKey, systemPrompt, userPrompt, { json = false } =
         Authorization: `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+        // llama-3.3-70b-versatile was deprecated by Groq (announced Jun 17,
+        // 2026) and fully decommissioned Aug 16, 2026 — requests using it
+        // now return 404. openai/gpt-oss-120b is Groq's own recommended
+        // replacement for this exact model (per console.groq.com/docs/
+        // deprecations), and supports the same JSON-mode response_format
+        // used below. Still configurable via GROQ_MODEL for future migrations.
+        model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
@@ -111,11 +117,48 @@ const generateTitle = async (topic) => {
   return raw.replace(/^["']|["']$/g, '');
 };
 
+// Multi-option variant for the "Generate & Select" workflow (4-5 title
+// options in one call, so the creator can compare and pick rather than
+// re-rolling a single result repeatedly).
+const generateTitleOptions = async (topic, count = 5) => {
+  const n = Math.min(Math.max(Number(count) || 5, 3), 5);
+  const raw = await callGroq(
+    `You are a YouTube SEO expert. Generate exactly ${n} distinct, catchy, click-worthy YouTube video title options for the given topic — ` +
+      'each under 90 characters, genuinely different angles/hooks from each other, not just reworded variants of the same phrase. ' +
+      'Reply with ONLY a JSON object: {"titles": [string]}. No markdown, no extra text.',
+    `Video topic: ${topic}`,
+    { json: true }
+  );
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.titles) ? parsed.titles.slice(0, n) : [];
+  } catch {
+    throw new Error('Groq returned a non-JSON response for title options');
+  }
+};
+
 const generateDescription = async (topic) => {
   return callGroq(
     'You are a YouTube SEO expert. Write a compelling, SEO-optimized YouTube video description (150-300 words) with a hook in the first two lines. Reply with ONLY the description text.',
     `Video topic: ${topic}`
   );
+};
+
+// Multi-option variant, same rationale as generateTitleOptions above.
+const generateDescriptionOptions = async (topic, count = 4) => {
+  const n = Math.min(Math.max(Number(count) || 4, 3), 5);
+  const raw = await callGroq(
+    `You are a YouTube SEO expert. Generate exactly ${n} distinct SEO-optimized YouTube video description options (100-200 words each) for the ` +
+      'given topic, each with a different opening hook/angle from the others. Reply with ONLY a JSON object: {"descriptions": [string]}. No markdown, no extra text.',
+    `Video topic: ${topic}`,
+    { json: true }
+  );
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.descriptions) ? parsed.descriptions.slice(0, n) : [];
+  } catch {
+    throw new Error('Groq returned a non-JSON response for description options');
+  }
 };
 
 const generateTags = async (topic) => {
@@ -238,7 +281,9 @@ const suggestTags = (topic) => generateTags(topic);
 module.exports = {
   callGroqWithFailover,
   generateTitle,
+  generateTitleOptions,
   generateDescription,
+  generateDescriptionOptions,
   generateTags,
   generateCaption,
   generateHashtags,
