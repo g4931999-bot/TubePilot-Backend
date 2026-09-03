@@ -5,6 +5,7 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
 const { createCashfreeOrder, getCashfreeOrderStatus } = require('../utils/cashfree');
+const GiftCode = require('../models/GiftCode');
 
 const router = express.Router();
 
@@ -173,6 +174,25 @@ router.post('/buy', protect, handleCreateOrder);
 router.post('/verify-payment', protect, handleVerifyPayment);
 router.post('/verify', protect, handleVerifyPayment);
 
+// @route GET /api/payment/return  (Cashfree browser/WebView redirect target —
+// see order_meta.return_url in utils/cashfree.js). This is a plain landing
+// page, NOT how diamonds get credited — that always happens via
+// verify-payment (called from the app) or the /webhook route below. This
+// route only exists so that if Cashfree's checkout WebView ever navigates
+// here mid-flow (e.g. after a netbanking/3DS redirect), the user sees a
+// normal page instead of a 404, and the native app's own polling
+// (see _confirmWithBackend in diamond_store_screen.dart) picks up the
+// real result independently.
+router.get('/return', (req, res) => {
+  res.set('Content-Type', 'text/html').send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TubePilot Payment</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:60px 20px;">
+  <h2>Payment received</h2>
+  <p>You can close this window and return to the TubePilot app — your diamonds will be credited automatically once confirmed.</p>
+</body></html>`);
+});
+
 // @route POST /api/diamonds/webhook  (Cashfree server-to-server webhook)
 router.post('/webhook', async (req, res) => {
   try {
@@ -228,6 +248,56 @@ router.post('/webhook', async (req, res) => {
   } catch (err) {
     console.error('❌ [Cashfree Webhook] error:', err.response?.data || err.message);
     res.status(200).json({ success: true });
+  }
+});
+
+// @route POST /api/diamonds/redeem-gift-code  { code }
+router.post('/redeem-gift-code', protect, async (req, res) => {
+  try {
+    const code = (req.body.code || '').trim().toUpperCase();
+    if (!code) return res.status(400).json({ success: false, message: 'Enter a gift code' });
+
+    const giftCode = await GiftCode.findOne({ code });
+    if (!giftCode) return res.status(404).json({ success: false, message: 'Invalid gift code' });
+    if (!giftCode.active) return res.status(400).json({ success: false, message: 'This gift code is no longer active' });
+    if (giftCode.maxRedemptions !== null && giftCode.redeemedBy.length >= giftCode.maxRedemptions) {
+      return res.status(400).json({ success: false, message: 'This gift code has reached its redemption limit' });
+    }
+
+    // Atomic claim: adds this user to redeemedBy ONLY if they're not
+    // already in it (the $ne guard on the filter), so a double-tap or two
+    // concurrent requests can't both succeed for the same user+code pair.
+    const claimed = await GiftCode.findOneAndUpdate(
+      { _id: giftCode._id, 'redeemedBy.user': { $ne: req.user._id } },
+      { $push: { redeemedBy: { user: req.user._id, redeemedAt: new Date() } } },
+      { new: true }
+    );
+
+    if (!claimed) {
+      return res.status(409).json({ success: false, message: 'You have already redeemed this gift code' });
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user._id,
+      { $inc: { diamondBalance: claimed.diamondValue } },
+      { new: true }
+    );
+
+    await Notification.create({
+      user: req.user._id,
+      type: 'gift_code_redeemed',
+      title: 'Gift Code Redeemed 🎁',
+      message: `+${claimed.diamondValue} diamonds added to your wallet.`
+    });
+
+    res.json({
+      success: true,
+      message: `${claimed.diamondValue} diamonds added to your wallet!`,
+      diamondsAwarded: claimed.diamondValue,
+      diamondBalance: updatedUser.diamondBalance
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
