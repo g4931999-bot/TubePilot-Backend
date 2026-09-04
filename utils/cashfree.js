@@ -14,6 +14,23 @@ const BASE_URL = IS_PROD
 
 const isConfigured = !!(CASHFREE_APP_ID && CASHFREE_SECRET_KEY);
 
+// ⚠️ FIX: return_url below falls back to a placeholder domain
+// ('https://tubepilot.app') if APP_BASE_URL isn't set. That placeholder is
+// almost certainly NOT your real deployed backend, so Cashfree's checkout
+// would redirect to a domain that doesn't even serve your new GET
+// /api/payment/verify route (see routes/diamond.js) — same "checkout
+// closes immediately" symptom, just from a different cause. This warns
+// loudly at startup instead of failing silently in production.
+if (!process.env.APP_BASE_URL) {
+  console.warn(
+    '⚠️ [Cashfree] APP_BASE_URL is not set in your .env file — payment ' +
+    'return_url will fall back to a placeholder domain that is NOT your ' +
+    'real backend. Set APP_BASE_URL=https://<your-actual-backend-domain> ' +
+    'in .env or the Cashfree checkout may close/error unexpectedly for ' +
+    'redirect-based payment methods (UPI collect, netbanking, card 3DS).'
+  );
+}
+
 const cashfreeHeaders = () => ({
   'x-client-id': CASHFREE_APP_ID,
   'x-client-secret': CASHFREE_SECRET_KEY,
@@ -52,25 +69,8 @@ const createCashfreeOrder = async ({
     throw new Error('Cashfree production credentials (APP_ID / SECRET_KEY) are missing in environment variables.');
   }
 
-  // Production app redirect URL fallback.
-  // ⚠️ FIX: was reading `process.env.APP_BASE_URL` (a var not set anywhere
-  // else in this codebase — utils/meta.js and routes/meta.js both use
-  // `BACKEND_URL`) and falling back to the wrong domain `tubepilot.app`
-  // instead of the real API domain `api.tubepilot.shop`. If APP_BASE_URL
-  // was never set in Render's env vars, every order's return_url pointed
-  // at a domain/path that doesn't resolve to this backend at all. Also
-  // routed to `/api/payment/verify` which only ever existed as a POST
-  // route (see routes/diamond.js) — a browser/WebView redirect is always
-  // GET, so even the correct domain would have 404'd. Now uses the same
-  // `BACKEND_URL` env var as the rest of the app, and points at the new
-  // GET landing route added in routes/diamond.js.
-  //
-  // Trailing slash guard: if BACKEND_URL is set on Render as
-  // "https://api.tubepilot.shop/" (with a trailing slash), naively
-  // concatenating "/api/payment/return..." would produce a double slash
-  // ("...shop//api/..."). Stripped defensively so this works either way.
-  const backendBase = (process.env.BACKEND_URL || 'https://api.tubepilot.shop').replace(/\/+$/, '');
-  const appReturnUrl = returnUrl || `${backendBase}/api/payment/return?order_id={order_id}`;
+  // Production app redirect URL fallback
+  const appReturnUrl = returnUrl || `${process.env.APP_BASE_URL || 'https://tubepilot.app'}/api/payment/verify?order_id={order_id}`;
 
   const res = await axios.post(
     `${BASE_URL}/orders`,
