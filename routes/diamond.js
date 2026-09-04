@@ -174,23 +174,35 @@ router.post('/buy', protect, handleCreateOrder);
 router.post('/verify-payment', protect, handleVerifyPayment);
 router.post('/verify', protect, handleVerifyPayment);
 
-// @route GET /api/payment/return  (Cashfree browser/WebView redirect target —
-// see order_meta.return_url in utils/cashfree.js). This is a plain landing
-// page, NOT how diamonds get credited — that always happens via
-// verify-payment (called from the app) or the /webhook route below. This
-// route only exists so that if Cashfree's checkout WebView ever navigates
-// here mid-flow (e.g. after a netbanking/3DS redirect), the user sees a
-// normal page instead of a 404, and the native app's own polling
-// (see _confirmWithBackend in diamond_store_screen.dart) picks up the
-// real result independently.
-router.get('/return', (req, res) => {
-  res.set('Content-Type', 'text/html').send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TubePilot Payment</title></head>
-<body style="font-family:sans-serif;text-align:center;padding:60px 20px;">
-  <h2>Payment received</h2>
-  <p>You can close this window and return to the TubePilot app — your diamonds will be credited automatically once confirmed.</p>
-</body></html>`);
+// @route GET /api/payment/verify?order_id=...  (Cashfree's return_url —
+// see utils/cashfree.js order_meta.return_url)
+//
+// ⚠️ FIX ("API route not found" + payment sheet closing immediately):
+// order_meta.return_url points here, and Cashfree's checkout navigates to
+// it (as a GET, inside its own webview) after any redirect-based payment
+// method completes — UPI collect, netbanking, card 3DS. No GET route
+// existed for this path before, only the POST /verify-payment above, so
+// every such redirect hit Express's global `/api` 404 handler and the
+// checkout webview closed/errored right after.
+//
+// This route does NOT credit diamonds — that still only ever happens
+// through handleVerifyPayment (polled from the app after checkout closes)
+// or the /webhook route below, both of which re-confirm directly with
+// Cashfree's server. This route's only job is to hand the webview back a
+// normal 200 page instead of a 404 so it can close cleanly; the app's own
+// _confirmWithBackend() polling loop is what actually finishes the flow.
+router.get('/verify', (req, res) => {
+  res.status(200).send(`<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Payment Received</title>
+  </head>
+  <body style="font-family:sans-serif;text-align:center;padding-top:60px;color:#222;">
+    <h2>✅ Payment received</h2>
+    <p>You can close this window and return to the app.</p>
+  </body>
+</html>`);
 });
 
 // @route POST /api/diamonds/webhook  (Cashfree server-to-server webhook)
