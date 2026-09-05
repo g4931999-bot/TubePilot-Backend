@@ -5,6 +5,9 @@ const { generateTitle, generateTitleOptions, generateDescription, generateDescri
 const router = express.Router();
 
 // AI features cost diamonds (premium feature) - adjust cost as needed
+// NOTE: `ideas` is now FREE (see /ideas route below) — kept here only so
+// the cost map stays a single source of truth if it's ever referenced
+// elsewhere; the /ideas route no longer charges it.
 const AI_FEATURE_COST = { title: 2, description: 2, tags: 2, caption: 2, hashtags: 2, ideas: 3, seoScore: 1, titleOptions: 3, descriptionOptions: 3 };
 
 const chargeDiamonds = async (user, cost) => {
@@ -136,17 +139,20 @@ router.post('/hashtags', protect, async (req, res) => {
 // @route POST /api/ai/ideas  { niche, platform?, count? }
 // VidIQ-style "Daily Ideas" generator — 3-5 viral video/reel ideas with a
 // title, hook line, and short description each.
+//
+// ⚠️ FREE FEATURE (boss request): unlike every other /ai/* route above,
+// this one does NOT charge diamonds. It only fails on a genuine upstream
+// error (Groq down/misconfigured), never with an "insufficient diamonds"
+// message — there is no diamond check here at all.
 router.post('/ideas', protect, async (req, res) => {
   try {
     const { niche, platform = 'youtube', count = 5 } = req.body;
     if (!niche) return res.status(400).json({ success: false, message: 'niche is required' });
 
-    await chargeDiamonds(req.user, AI_FEATURE_COST.ideas);
     const ideas = await generateAiScript({ niche, platform, count });
-    res.json({ success: true, ideas, diamondsCharged: AI_FEATURE_COST.ideas, remainingDiamonds: req.user.diamondBalance });
+    res.json({ success: true, ideas, diamondsCharged: 0, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
