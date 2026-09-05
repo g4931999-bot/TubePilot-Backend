@@ -66,6 +66,50 @@ router.get('/', protect, async (req, res) => {
 // Competitor Tracking
 // ---------------------------------------------------------------------------
 
+// @route GET /api/analytics/competitors/search?q=tube
+// Live channel-name search for the "add competitor" autocomplete — used by
+// the Competitor Radar screen's search field so the user can type a partial
+// name (e.g. "tube") and pick from real matching YouTube channels instead
+// of typing an exact @handle or channel ID.
+//
+// Uses YouTube Data API's public search.list (type=channel) with the same
+// YOUTUBE_DATA_API_KEY the app already relies on for public stats (see
+// utils/youtubePublic.js) — no separate credential needed.
+//
+// IMPORTANT: this route must stay registered ABOVE any '/competitors/:id'
+// style route, otherwise Express would try to match "search" as an :id.
+router.get('/competitors/search', protect, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 2) return res.json({ success: true, results: [] });
+
+    const apiKey = process.env.YOUTUBE_DATA_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ success: false, message: 'YouTube search is unavailable — YOUTUBE_DATA_API_KEY not configured on the server.' });
+    }
+
+    const youtube = google.youtube({ version: 'v3', auth: apiKey });
+    const searchRes = await youtube.search.list({
+      part: 'snippet',
+      type: 'channel',
+      q,
+      maxResults: 8
+    });
+
+    const results = (searchRes.data.items || []).map((item) => ({
+      channelId: item.snippet.channelId,
+      title: item.snippet.title,
+      description: item.snippet.description,
+      thumbnail: item.snippet.thumbnails?.default?.url || ''
+    }));
+
+    res.json({ success: true, results });
+  } catch (err) {
+    console.error('❌ [Competitor Search] failed:', err.response?.data || err.message);
+    res.status(500).json({ success: false, message: 'Search failed. Please try again.' });
+  }
+});
+
 // @route GET /api/analytics/competitors
 // Lists this user's tracked competitors. Any competitor whose cached stats
 // are missing or older than 6 hours gets refreshed inline before returning
