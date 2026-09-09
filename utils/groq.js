@@ -1,45 +1,45 @@
-// Uses Groq's OpenAI-compatible chat completion endpoint.
+// Uses Groq's OpenAI-compatible chat completion endpoint, with OpenRouter
+// as a further fallback provider.
 // Docs: https://console.groq.com/docs/api-reference#chat-create
+//       https://openrouter.ai/docs
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 // ---------------------------------------------------------------------------
-// Dual API Key Automatic Failover
+// Triple Provider Automatic Failover: Groq Key 1 -> Groq Key 2 -> OpenRouter
 // ---------------------------------------------------------------------------
 // GROQ_API_KEY_1 falls back to the legacy GROQ_API_KEY env var so existing
-// deployments that only set GROQ_API_KEY keep working unchanged — they just
-// won't have a second key to fail over to until GROQ_API_KEY_2 is set too.
+// deployments that only set GROQ_API_KEY keep working unchanged. OPENROUTER_API_KEY
+// is a NEW, separate, optional third provider — if it isn't set, behavior is
+// unchanged from before (Groq-only, 2-key failover).
 const KEY_1 = process.env.GROQ_API_KEY_1 || process.env.GROQ_API_KEY;
 const KEY_2 = process.env.GROQ_API_KEY_2;
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 
-// Errors that mean "this key is exhausted/bad, try the other one" —
-// anything else (a malformed prompt, a 400, etc.) is the same on both keys
-// so retrying with key 2 would just waste a call and hide the real error.
+// Errors that mean "this key/provider is exhausted/bad, try the next one" —
+// anything else (a malformed prompt, a 400, etc.) is the same on every
+// provider so retrying would just waste a call and hide the real error.
 const isFailoverWorthyError = (status, errText) => {
   if (status === 429) return true; // rate limit / quota exhausted
   if (status === 401 || status === 403) return true; // invalid/revoked key
-  if (status >= 500) return true; // Groq-side outage — worth one retry on the other key
+  if (status >= 500) return true; // provider-side outage — worth one retry elsewhere
   if (/insufficient_quota|rate.?limit|invalid.api.?key/i.test(errText || '')) return true;
   return false;
 };
 
-const callGroqOnce = async (apiKey, systemPrompt, userPrompt, { json = false } = {}) => {
+const callChatCompletionOnce = async (url, apiKey, model, systemPrompt, userPrompt, { json = false, extraHeaders = {} } = {}) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25000); // network-timeout guard
   try {
-    const res = await fetch(GROQ_URL, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
+        Authorization: `Bearer ${apiKey}`,
+        ...extraHeaders
       },
       body: JSON.stringify({
-        // llama-3.3-70b-versatile was deprecated by Groq (announced Jun 17,
-        // 2026) and fully decommissioned Aug 16, 2026 — requests using it
-        // now return 404. openai/gpt-oss-120b is Groq's own recommended
-        // replacement for this exact model (per console.groq.com/docs/
-        // deprecations), and supports the same JSON-mode response_format
-        // used below. Still configurable via GROQ_MODEL for future migrations.
-        model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+        model,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
@@ -52,9 +52,9 @@ const callGroqOnce = async (apiKey, systemPrompt, userPrompt, { json = false } =
 
     if (!res.ok) {
       const errText = await res.text();
-      const err = new Error(`Groq API error (${res.status}): ${errText}`);
+      const err = new Error(`Chat completion error (${res.status}): ${errText}`);
       err.status = res.status;
-      err.groqBody = errText;
+      err.body = errText;
       throw err;
     }
 
@@ -65,48 +65,86 @@ const callGroqOnce = async (apiKey, systemPrompt, userPrompt, { json = false } =
   }
 };
 
+// llama-3.3-70b-versatile was deprecated by Groq (announced Jun 17, 2026) and
+// fully decommissioned Aug 16, 2026 — requests using it now return 404.
+// openai/gpt-oss-120b is Groq's own recommended replacement for this exact
+// model (per console.groq.com/docs/deprecations), and supports the same
+// JSON-mode response_format used below. Still configurable via GROQ_MODEL
+// for future migrations.
+const callGroqOnce = (apiKey, systemPrompt, userPrompt, options = {}) =>
+  callChatCompletionOnce(GROQ_URL, apiKey, process.env.GROQ_MODEL || 'openai/gpt-oss-120b', systemPrompt, userPrompt, options);
+
+// ⚠️ NEW (Boss request — third provider): OpenRouter as a further fallback
+// once BOTH Groq keys have failed. Model defaults to the same
+// "openai/gpt-oss-120b" so response shape/behavior stays consistent with
+// Groq — configurable separately via OPENROUTER_MODEL if a different model
+// is ever preferred on OpenRouter. HTTP-Referer/X-Title headers are
+// optional (only affect OpenRouter's own leaderboard attribution), so
+// they're omitted rather than hardcoded to a placeholder URL.
+const callOpenRouterOnce = (apiKey, systemPrompt, userPrompt, options = {}) =>
+  callChatCompletionOnce(OPENROUTER_URL, apiKey, process.env.OPENROUTER_MODEL || 'openai/gpt-oss-120b', systemPrompt, userPrompt, options);
+
 /**
  * callGroqWithFailover(systemPrompt, userPrompt, options?)
  * Tries GROQ_API_KEY_1 first. On a rate-limit / quota / invalid-key /
- * network-timeout style failure, silently retries once on GROQ_API_KEY_2
- * (if configured) instead of surfacing the error to the caller. Any other
- * kind of error (bad request, parsing issue) is NOT retried — it's thrown
- * as-is since a second key won't fix it.
+ * network-timeout style failure, retries GROQ_API_KEY_2 (if configured).
+ * If BOTH Groq keys fail in a failover-worthy way, falls over once more to
+ * OPENROUTER_API_KEY (if configured) as a last resort before finally
+ * throwing. Any non-failover-worthy error (bad request, parsing issue) is
+ * NOT retried on any provider — it's thrown as-is since switching keys/
+ * providers won't fix it.
  *
- * options.json: true requests Groq's JSON mode (used by ideas/seo-score,
- * where the caller needs structured output rather than free text).
+ * options.json: true requests JSON mode (used by ideas/seo-score, where
+ * the caller needs structured output rather than free text). Supported by
+ * Groq and by OpenRouter for OpenAI-compatible models.
  */
 const callGroqWithFailover = async (systemPrompt, userPrompt, options = {}) => {
-  if (!KEY_1 && !KEY_2) {
-    throw new Error('Groq is not configured: set GROQ_API_KEY_1 (or GROQ_API_KEY) and optionally GROQ_API_KEY_2');
+  if (!KEY_1 && !KEY_2 && !OPENROUTER_KEY) {
+    throw new Error('No AI provider is configured: set GROQ_API_KEY_1 (or GROQ_API_KEY), and optionally GROQ_API_KEY_2 and/or OPENROUTER_API_KEY');
   }
+
+  let lastErr = null;
 
   if (KEY_1) {
     try {
       return await callGroqOnce(KEY_1, systemPrompt, userPrompt, options);
     } catch (err) {
       const isTimeout = err.name === 'AbortError';
-      const worthFailover = isTimeout || isFailoverWorthyError(err.status, err.groqBody);
-      if (!worthFailover || !KEY_2) {
-        if (isTimeout) throw new Error('Groq API request timed out');
-        throw err;
-      }
-      console.warn(`⚠️ Groq primary key failed (${isTimeout ? 'timeout' : err.status}), failing over to GROQ_API_KEY_2...`);
+      const worthFailover = isTimeout || isFailoverWorthyError(err.status, err.body);
+      lastErr = isTimeout ? new Error('Groq API request timed out (key 1)') : err;
+      if (!worthFailover) throw lastErr;
+      console.warn(`⚠️ Groq primary key failed (${isTimeout ? 'timeout' : err.status}), trying next provider...`);
     }
   }
 
-  // Either key 1 wasn't configured, or it just failed in a failover-worthy way.
-  if (!KEY_2) throw new Error('Groq primary key failed and no GROQ_API_KEY_2 fallback is configured');
-  try {
-    return await callGroqOnce(KEY_2, systemPrompt, userPrompt, options);
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Groq API request timed out on fallback key');
-    throw new Error(`Groq API failed on both keys — last error: ${err.message}`);
+  if (KEY_2) {
+    try {
+      return await callGroqOnce(KEY_2, systemPrompt, userPrompt, options);
+    } catch (err) {
+      const isTimeout = err.name === 'AbortError';
+      const worthFailover = isTimeout || isFailoverWorthyError(err.status, err.body);
+      lastErr = isTimeout ? new Error('Groq API request timed out (key 2)') : err;
+      if (!worthFailover) throw lastErr;
+      console.warn(`⚠️ Groq secondary key failed (${isTimeout ? 'timeout' : err.status}), trying OpenRouter...`);
+    }
   }
+
+  if (OPENROUTER_KEY) {
+    try {
+      return await callOpenRouterOnce(OPENROUTER_KEY, systemPrompt, userPrompt, options);
+    } catch (err) {
+      const isTimeout = err.name === 'AbortError';
+      lastErr = isTimeout ? new Error('OpenRouter API request timed out') : err;
+      throw new Error(`AI request failed on every configured provider — last error: ${lastErr.message}`);
+    }
+  }
+
+  // No OpenRouter key configured and both Groq keys exhausted/unset.
+  throw lastErr || new Error('AI request failed and no fallback provider is configured');
 };
 
 // Kept as an internal alias so every existing generate* helper below reads
-// unchanged — callGroq now transparently has dual-key failover.
+// unchanged — callGroq now transparently has 3-provider failover.
 const callGroq = callGroqWithFailover;
 
 const generateTitle = async (topic) => {
@@ -133,7 +171,7 @@ const generateTitleOptions = async (topic, count = 5) => {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed.titles) ? parsed.titles.slice(0, n) : [];
   } catch {
-    throw new Error('Groq returned a non-JSON response for title options');
+    throw new Error('AI provider returned a non-JSON response for title options');
   }
 };
 
@@ -157,7 +195,7 @@ const generateDescriptionOptions = async (topic, count = 4) => {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed.descriptions) ? parsed.descriptions.slice(0, n) : [];
   } catch {
-    throw new Error('Groq returned a non-JSON response for description options');
+    throw new Error('AI provider returned a non-JSON response for description options');
   }
 };
 
@@ -216,8 +254,8 @@ const generateReviewText = async (stars) => {
 // ---------------------------------------------------------------------------
 
 // POST /api/ai/ideas — 3-5 daily viral video/reel script ideas.
-// Reply is parsed as JSON ({ ideas: [...] }) via Groq's JSON mode so the
-// route doesn't have to regex-parse free text.
+// Reply is parsed as JSON ({ ideas: [...] }) via JSON mode so the route
+// doesn't have to regex-parse free text.
 const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
   const n = Math.min(Math.max(Number(count) || 5, 3), 5);
   const raw = await callGroq(
@@ -241,7 +279,7 @@ const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
         }))
       : [];
   } catch {
-    throw new Error('Groq returned a non-JSON response for ideas generation');
+    throw new Error('AI provider returned a non-JSON response for ideas generation');
   }
 };
 
@@ -269,7 +307,7 @@ const analyzeSeoScore = async ({ title, description, tags = [], platform = 'yout
       notes: parsed.notes || ''
     };
   } catch {
-    throw new Error('Groq returned a non-JSON response for SEO scoring');
+    throw new Error('AI provider returned a non-JSON response for SEO scoring');
   }
 };
 
