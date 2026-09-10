@@ -20,6 +20,40 @@ const chargeDiamonds = async (user, cost) => {
   await user.save();
 };
 
+// ⚠️ DIAGNOSTIC (temporary — Boss request, "exact error dikhana hai"):
+// logs the FULL error (message + stack) to the server console every time
+// any /api/ai/* route fails, so it shows up in your hosting platform's
+// Logs tab (Render/Railway/Heroku/etc) even without CLI/SSH access. Safe
+// to leave in permanently — it only writes to server logs, never exposed
+// to the client — but you can remove the console.error lines later once
+// things are stable if you want quieter logs.
+const logAiError = (routeName, err) => {
+  console.error(`❌ [AI:${routeName}] ${err.message}`);
+  if (err.stack) console.error(err.stack);
+};
+
+// @route GET /api/ai/debug-env
+// ⚠️ DIAGNOSTIC (temporary — Boss request): lets you check, straight from
+// the deployed server, whether the Groq/OpenRouter API keys are actually
+// set — no CLI or hosting-dashboard access needed. Just hit this URL
+// (with your normal auth token, same as any other /api/ai/* call) from
+// the browser, Postman, or curl:
+//   GET https://<your-backend-domain>/api/ai/debug-env
+// Never returns the actual key values — only whether each is present, and
+// which model name will be used. Remove this route once the AI errors
+// are fully resolved and you no longer need it.
+router.get('/debug-env', protect, (req, res) => {
+  res.json({
+    success: true,
+    hasGroqKey1: !!(process.env.GROQ_API_KEY_1 || process.env.GROQ_API_KEY),
+    hasGroqKey2: !!process.env.GROQ_API_KEY_2,
+    hasOpenRouterKey: !!process.env.OPENROUTER_API_KEY,
+    groqModel: process.env.GROQ_MODEL || 'openai/gpt-oss-120b (default)',
+    openRouterModel: process.env.OPENROUTER_MODEL || 'openai/gpt-oss-120b (default)',
+    nodeEnv: process.env.NODE_ENV || '(not set)'
+  });
+});
+
 // @route POST /api/ai/title  { topic }
 router.post('/title', protect, async (req, res) => {
   try {
@@ -30,6 +64,7 @@ router.post('/title', protect, async (req, res) => {
     const title = await generateTitle(topic);
     res.json({ success: true, title, diamondsCharged: AI_FEATURE_COST.title, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('title', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -47,6 +82,7 @@ router.post('/title-options', protect, async (req, res) => {
     const titles = await generateTitleOptions(topic, count);
     res.json({ success: true, titles, diamondsCharged: AI_FEATURE_COST.titleOptions, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('title-options', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -62,6 +98,7 @@ router.post('/description', protect, async (req, res) => {
     const description = await generateDescription(topic);
     res.json({ success: true, description, diamondsCharged: AI_FEATURE_COST.description, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('description', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -77,6 +114,7 @@ router.post('/description-options', protect, async (req, res) => {
     const descriptions = await generateDescriptionOptions(topic, count);
     res.json({ success: true, descriptions, diamondsCharged: AI_FEATURE_COST.descriptionOptions, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('description-options', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -92,6 +130,7 @@ router.post('/tags', protect, async (req, res) => {
     const tags = await generateTags(topic);
     res.json({ success: true, tags, diamondsCharged: AI_FEATURE_COST.tags, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('tags', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -113,6 +152,7 @@ router.post('/caption', protect, async (req, res) => {
     const caption = await generateCaption(topic, platform);
     res.json({ success: true, caption, diamondsCharged: AI_FEATURE_COST.caption, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('caption', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -131,6 +171,7 @@ router.post('/hashtags', protect, async (req, res) => {
     const hashtags = await generateHashtags(topic, platform);
     res.json({ success: true, hashtags, diamondsCharged: AI_FEATURE_COST.hashtags, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('hashtags', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -152,6 +193,7 @@ router.post('/ideas', protect, async (req, res) => {
     const ideas = await generateAiScript({ niche, platform, count });
     res.json({ success: true, ideas, diamondsCharged: 0, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('ideas', err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -168,6 +210,7 @@ router.post('/seo-score', protect, async (req, res) => {
     const result = await analyzeSeoScore({ title, description, tags, platform });
     res.json({ success: true, ...result, diamondsCharged: AI_FEATURE_COST.seoScore, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
+    logAiError('seo-score', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
