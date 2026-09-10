@@ -5,31 +5,21 @@
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-// ---------------------------------------------------------------------------
-// Triple Provider Automatic Failover: Groq Key 1 -> Groq Key 2 -> OpenRouter
-// ---------------------------------------------------------------------------
-// GROQ_API_KEY_1 falls back to the legacy GROQ_API_KEY env var so existing
-// deployments that only set GROQ_API_KEY keep working unchanged. OPENROUTER_API_KEY
-// is a NEW, separate, optional third provider — if it isn't set, behavior is
-// unchanged from before (Groq-only, 2-key failover).
 const KEY_1 = process.env.GROQ_API_KEY_1 || process.env.GROQ_API_KEY;
 const KEY_2 = process.env.GROQ_API_KEY_2;
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 
-// Errors that mean "this key/provider is exhausted/bad, try the next one" —
-// anything else (a malformed prompt, a 400, etc.) is the same on every
-// provider so retrying would just waste a call and hide the real error.
 const isFailoverWorthyError = (status, errText) => {
-  if (status === 429) return true; // rate limit / quota exhausted
-  if (status === 401 || status === 403) return true; // invalid/revoked key
-  if (status >= 500) return true; // provider-side outage — worth one retry elsewhere
+  if (status === 429) return true;
+  if (status === 401 || status === 403) return true;
+  if (status >= 500) return true;
   if (/insufficient_quota|rate.?limit|invalid.api.?key/i.test(errText || '')) return true;
   return false;
 };
 
 const callChatCompletionOnce = async (url, apiKey, model, systemPrompt, userPrompt, { json = false, extraHeaders = {} } = {}) => {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000); // network-timeout guard
+  const timeout = setTimeout(() => controller.abort(), 25000);
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -65,39 +55,12 @@ const callChatCompletionOnce = async (url, apiKey, model, systemPrompt, userProm
   }
 };
 
-// llama-3.3-70b-versatile was deprecated by Groq (announced Jun 17, 2026) and
-// fully decommissioned Aug 16, 2026 — requests using it now return 404.
-// openai/gpt-oss-120b is Groq's own recommended replacement for this exact
-// model (per console.groq.com/docs/deprecations), and supports the same
-// JSON-mode response_format used below. Still configurable via GROQ_MODEL
-// for future migrations.
 const callGroqOnce = (apiKey, systemPrompt, userPrompt, options = {}) =>
   callChatCompletionOnce(GROQ_URL, apiKey, process.env.GROQ_MODEL || 'openai/gpt-oss-120b', systemPrompt, userPrompt, options);
 
-// ⚠️ NEW (Boss request — third provider): OpenRouter as a further fallback
-// once BOTH Groq keys have failed. Model defaults to the same
-// "openai/gpt-oss-120b" so response shape/behavior stays consistent with
-// Groq — configurable separately via OPENROUTER_MODEL if a different model
-// is ever preferred on OpenRouter. HTTP-Referer/X-Title headers are
-// optional (only affect OpenRouter's own leaderboard attribution), so
-// they're omitted rather than hardcoded to a placeholder URL.
 const callOpenRouterOnce = (apiKey, systemPrompt, userPrompt, options = {}) =>
   callChatCompletionOnce(OPENROUTER_URL, apiKey, process.env.OPENROUTER_MODEL || 'openai/gpt-oss-120b', systemPrompt, userPrompt, options);
 
-/**
- * callGroqWithFailover(systemPrompt, userPrompt, options?)
- * Tries GROQ_API_KEY_1 first. On a rate-limit / quota / invalid-key /
- * network-timeout style failure, retries GROQ_API_KEY_2 (if configured).
- * If BOTH Groq keys fail in a failover-worthy way, falls over once more to
- * OPENROUTER_API_KEY (if configured) as a last resort before finally
- * throwing. Any non-failover-worthy error (bad request, parsing issue) is
- * NOT retried on any provider — it's thrown as-is since switching keys/
- * providers won't fix it.
- *
- * options.json: true requests JSON mode (used by ideas/seo-score, where
- * the caller needs structured output rather than free text). Supported by
- * Groq and by OpenRouter for OpenAI-compatible models.
- */
 const callGroqWithFailover = async (systemPrompt, userPrompt, options = {}) => {
   if (!KEY_1 && !KEY_2 && !OPENROUTER_KEY) {
     throw new Error('No AI provider is configured: set GROQ_API_KEY_1 (or GROQ_API_KEY), and optionally GROQ_API_KEY_2 and/or OPENROUTER_API_KEY');
@@ -113,7 +76,7 @@ const callGroqWithFailover = async (systemPrompt, userPrompt, options = {}) => {
       const worthFailover = isTimeout || isFailoverWorthyError(err.status, err.body);
       lastErr = isTimeout ? new Error('Groq API request timed out (key 1)') : err;
       if (!worthFailover) throw lastErr;
-      console.warn(`⚠️ Groq primary key failed (${isTimeout ? 'timeout' : err.status}), trying next provider...`);
+      console.warn(`Groq primary key failed (${isTimeout ? 'timeout' : err.status}), trying next provider...`);
     }
   }
 
@@ -125,7 +88,7 @@ const callGroqWithFailover = async (systemPrompt, userPrompt, options = {}) => {
       const worthFailover = isTimeout || isFailoverWorthyError(err.status, err.body);
       lastErr = isTimeout ? new Error('Groq API request timed out (key 2)') : err;
       if (!worthFailover) throw lastErr;
-      console.warn(`⚠️ Groq secondary key failed (${isTimeout ? 'timeout' : err.status}), trying OpenRouter...`);
+      console.warn(`Groq secondary key failed (${isTimeout ? 'timeout' : err.status}), trying OpenRouter...`);
     }
   }
 
@@ -139,12 +102,9 @@ const callGroqWithFailover = async (systemPrompt, userPrompt, options = {}) => {
     }
   }
 
-  // No OpenRouter key configured and both Groq keys exhausted/unset.
   throw lastErr || new Error('AI request failed and no fallback provider is configured');
 };
 
-// Kept as an internal alias so every existing generate* helper below reads
-// unchanged — callGroq now transparently has 3-provider failover.
 const callGroq = callGroqWithFailover;
 
 const generateTitle = async (topic) => {
@@ -155,9 +115,6 @@ const generateTitle = async (topic) => {
   return raw.replace(/^["']|["']$/g, '');
 };
 
-// Multi-option variant for the "Generate & Select" workflow (4-5 title
-// options in one call, so the creator can compare and pick rather than
-// re-rolling a single result repeatedly).
 const generateTitleOptions = async (topic, count = 5) => {
   const n = Math.min(Math.max(Number(count) || 5, 3), 5);
   const raw = await callGroq(
@@ -182,7 +139,6 @@ const generateDescription = async (topic) => {
   );
 };
 
-// Multi-option variant, same rationale as generateTitleOptions above.
 const generateDescriptionOptions = async (topic, count = 4) => {
   const n = Math.min(Math.max(Number(count) || 4, 3), 5);
   const raw = await callGroq(
@@ -207,10 +163,6 @@ const generateTags = async (topic) => {
   return raw.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
 };
 
-// Platform-aware caption generator. Instagram and Facebook have different
-// tone/length conventions, so the system prompt is branched per platform
-// rather than reusing the YouTube description generator — this is what
-// keeps captions from ever being a copy of the YouTube title/description.
 const CAPTION_PROMPTS = {
   instagram: 'You are a social media copywriter specializing in Instagram Reels. Write a short, punchy, engaging caption (1-3 sentences, conversational tone, can include 1-2 emojis) that hooks viewers in the first line. Reply with ONLY the caption text, no hashtags.',
   facebook: 'You are a social media copywriter specializing in Facebook video posts. Write a friendly, slightly longer caption (2-4 sentences) that encourages comments and shares. Reply with ONLY the caption text, no hashtags.'
@@ -221,8 +173,6 @@ const generateCaption = async (topic, platform) => {
   return callGroq(systemPrompt, `Video/Reel topic: ${topic}`);
 };
 
-// Platform-aware hashtag generator. Instagram favors more hashtags than
-// Facebook, per each platform's own best-practice conventions.
 const HASHTAG_PROMPTS = {
   instagram: 'You are a social media growth expert specializing in Instagram Reels. Reply with ONLY a comma-separated list of 20 relevant, trending Instagram hashtags for the given topic (mix of broad and niche tags). No numbering, no extra text, no # symbol.',
   facebook: 'You are a social media growth expert specializing in Facebook video posts. Reply with ONLY a comma-separated list of 8 relevant Facebook hashtags for the given topic. No numbering, no extra text, no # symbol.'
@@ -234,8 +184,6 @@ const generateHashtags = async (topic, platform) => {
   return raw.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
 };
 
-// Used by routes/ratings.js's GET /suggest route to draft an app-store
-// review for the user to edit/submit, based on the star rating they picked.
 const generateReviewText = async (stars) => {
   const tone = stars >= 4
     ? 'positive and enthusiastic'
@@ -249,13 +197,6 @@ const generateReviewText = async (stars) => {
   );
 };
 
-// ---------------------------------------------------------------------------
-// VidIQ-style Creator OS additions
-// ---------------------------------------------------------------------------
-
-// POST /api/ai/ideas — 3-5 daily viral video/reel script ideas.
-// Reply is parsed as JSON ({ ideas: [...] }) via JSON mode so the route
-// doesn't have to regex-parse free text.
 const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
   const n = Math.min(Math.max(Number(count) || 5, 3), 5);
   const raw = await callGroq(
@@ -283,8 +224,6 @@ const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
   }
 };
 
-// POST /api/ai/seo-score — keyword density / CTR potential / length
-// compliance / tag relevance analysis of a title+description+tags set.
 const analyzeSeoScore = async ({ title, description, tags = [], platform = 'youtube' }) => {
   const raw = await callGroq(
     `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags. ` +
@@ -311,9 +250,6 @@ const analyzeSeoScore = async ({ title, description, tags = [], platform = 'yout
   }
 };
 
-// Generic tag suggester — thin wrapper around generateTags kept as its own
-// export per spec, in case a caller wants a platform-neutral name instead
-// of the YouTube-specific generateTags.
 const suggestTags = (topic) => generateTags(topic);
 
 module.exports = {
