@@ -6,8 +6,11 @@ const TransactionSchema = new mongoose.Schema({
 
   type: { type: String, enum: ['diamond_purchase', 'diamond_spend', 'diamond_refund'], default: 'diamond_purchase' },
 
-  // purchase package: 10 / 50 / 100 / 200 diamonds, price = diamonds x rate (1 diamond = ₹1)
-  diamondPackage: { type: Number, enum: [10, 50, 100, 200], required: function () { return this.type === 'diamond_purchase'; } },
+  // ⚠️ BOSS UPDATE: purchase package is now 99 / 299 / 599 / 799 diamonds
+  // (for ₹10 / ₹50 / ₹100 / ₹200 respectively) — price is NO LONGER
+  // diamonds x ₹1. amountINR below is what was actually charged; it is
+  // independent of diamondPackage now, not derived from it.
+  diamondPackage: { type: Number, enum: [99, 299, 599, 799], required: function () { return this.type === 'diamond_purchase'; } },
   amountINR: { type: Number, required: function () { return this.type === 'diamond_purchase'; } },
 
   diamondsForSpend: { type: Number, default: 0 }, // when type = diamond_spend/refund
