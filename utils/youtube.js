@@ -76,13 +76,82 @@ const updateVideoPrivacy = async ({ accessToken, refreshToken, videoId, privacyS
   return res.data;
 };
 
+// ⚠️ NEW (Boss request — Option B, "Apply to Video" should also cover
+// already-published channel videos, not just TubePilot's own queued
+// uploads): fetches the connected channel's real videos straight from
+// YouTube — same data the creator sees in YouTube Studio.
+//
+// Two-step approach because playlistItems.list (the "uploads" playlist)
+// is the cheapest way to enumerate a channel's videos, but doesn't
+// reliably include privacyStatus — so this only pulls what's needed for
+// a picker list (id/title/description/thumbnail/publishedAt). If a
+// caller later needs privacyStatus too, add a videos.list(part:'status')
+// pass over the returned ids — not done here to keep this to one API
+// round-trip pair (channels.list + playlistItems.list) per call.
+const listChannelVideos = async (accessToken, { maxResults = 25 } = {}) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+
+  const channelRes = await youtube.channels.list({ part: 'contentDetails', mine: true });
+  const uploadsPlaylistId = channelRes.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+  if (!uploadsPlaylistId) return [];
+
+  const itemsRes = await youtube.playlistItems.list({
+    part: 'snippet',
+    playlistId: uploadsPlaylistId,
+    maxResults
+  });
+
+  return (itemsRes.data.items || []).map((item) => ({
+    videoId: item.snippet.resourceId.videoId,
+    title: item.snippet.title,
+    description: item.snippet.description,
+    thumbnail: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
+    publishedAt: item.snippet.publishedAt
+  }));
+};
+
+// ⚠️ NEW (Boss request — Option B): updates title/description directly on
+// an already-published/live YouTube video (NOT TubePilot's own DB record —
+// this is a real YouTube API write). videos.update requires the FULL
+// snippet object (categoryId is mandatory), so this fetches the video's
+// current snippet first and merges in only the fields that changed,
+// leaving tags/categoryId/everything else exactly as they were.
+const updateVideoMetadataOnYoutube = async ({ accessToken, refreshToken, videoId, title, description }) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+
+  const existingRes = await youtube.videos.list({ part: 'snippet', id: videoId });
+  const existing = existingRes.data.items?.[0];
+  if (!existing) {
+    const err = new Error('Video not found on this YouTube channel');
+    err.status = 404;
+    throw err;
+  }
+
+  const mergedSnippet = {
+    ...existing.snippet,
+    ...(title !== undefined && title !== null ? { title } : {}),
+    ...(description !== undefined && description !== null ? { description } : {})
+  };
+
+  const res = await youtube.videos.update({
+    part: 'snippet',
+    requestBody: { id: videoId, snippet: mergedSnippet }
+  });
+  return res.data;
+};
+
 // Detects Google's "invalid_grant" response, which means the refresh token
 // itself is dead (user revoked access in their Google Account, token expired
 // from 6 months of inactivity, or the OAuth consent was reset). This is NOT
 // a transient network/API error — retrying won't help, the user must
 // reconnect their YouTube account. Used by cron/scheduler.js's
 // ensureFreshYouTubeToken() to decide between "stop retrying, ask user to
-// reconnect" vs "transient error, retry as normal".
+// reconnect" vs "transient error, retry as normal". Also now used by the
+// new /my-videos and /my-videos/:id routes for the same reason.
 const isInvalidGrantError = (err) => {
   const code = err?.response?.data?.error;
   const description = err?.response?.data?.error_description || err?.message || '';
@@ -92,5 +161,6 @@ const isInvalidGrantError = (err) => {
 module.exports = {
   getOAuthClient, exchangeCodeForTokens, refreshAccessToken,
   getChannelInfo, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy,
+  listChannelVideos, updateVideoMetadataOnYoutube,
   isInvalidGrantError
-};
+};s
