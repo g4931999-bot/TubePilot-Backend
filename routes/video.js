@@ -7,6 +7,9 @@ const { pickAvailableCloudinaryAccount, uploadBufferToCloudinary } = require('..
 const { uploadBufferToDrive } = require('../utils/googleDrive');
 const { sendOneSignalToUser } = require('../utils/oneSignalPush');
 const {
+  refreshAccessToken, isInvalidGrantError, listChannelVideos, deleteVideoFromYoutube
+} = require('../utils/youtube');
+const {
   getCurrentISTDateStr,
   addDaysToDateStr,
   buildISTInstant,
@@ -17,21 +20,10 @@ const {
 const router = express.Router();
 
 const DIAMOND_COST_PER_UPLOAD = Number(process.env.DIAMOND_COST_PER_UPLOAD || 10);
-
-// Business Rule #2: a scheduled post's target time can never be less than
-// "now + 1 hour" — guarantees enough margin for upload, processing,
-// thumbnail generation, and Meta/YouTube server-side rendering to finish
-// before the post is due to go live.
 const MIN_SCHEDULE_BUFFER_MS = 60 * 60 * 1000;
-
-// Business Rule #4: daily post-frequency cap, combined across every
-// platform on a video (posting to YouTube+Facebook+Instagram in one go
-// still only counts as ONE post for the day).
 const FREE_PLAN_DAILY_LIMIT = 1;
 const PREMIUM_PLAN_DAILY_LIMIT = 2;
 
-// Deducts 1 Free Credit OR 10 Diamonds ONCE per upload event,
-// regardless of 1, 2, or 3 platforms selected (YouTube, FB, IG, Carousel).
 const chargeForUpload = (user) => {
   if (user.freeUploadsRemaining > 0) {
     user.freeUploadsRemaining -= 1;
@@ -61,9 +53,6 @@ const parseJson = (str, fallback = {}) => {
   try { return JSON.parse(str); } catch (_) { return fallback; }
 };
 
-// Business Rule #2 enforcement. Pass null/undefined for an immediate
-// "Post Now" target — no buffer requirement applies since it isn't being
-// scheduled into the future at all.
 const assertScheduleBufferOk = (scheduledAt) => {
   if (!scheduledAt) return;
   const target = new Date(scheduledAt);
@@ -79,19 +68,12 @@ const assertScheduleBufferOk = (scheduledAt) => {
   }
 };
 
-// Business Rule #4 enforcement. Premium = active subscription that hasn't
-// expired; everyone else is on the Free plan.
 const getUserDailyPostLimit = (user) => {
   const sub = user.subscription;
   const isPremiumActive = !!(sub && sub.isActive && (!sub.expiresAt || new Date(sub.expiresAt) > new Date()));
   return isPremiumActive ? PREMIUM_PLAN_DAILY_LIMIT : FREE_PLAN_DAILY_LIMIT;
 };
 
-// Counts how many of this user's videos already occupy a given IST
-// calendar day — "occupy" meaning at least one of their platform targets
-// is scheduled that day, or (for immediate/no-schedule uploads) the video
-// was created that day. Permanently-failed videos (auto-refunded by the
-// cron scheduler) don't count against the day's quota.
 const countUserVideosOnISTDate = async (userId, dateStr, excludeVideoId = null) => {
   const { start, end } = getISTDayRangeUTC(dateStr);
   const query = {
@@ -106,11 +88,6 @@ const countUserVideosOnISTDate = async (userId, dateStr, excludeVideoId = null) 
   return Video.countDocuments(query);
 };
 
-// A single video/upload-event can target several platforms with slightly
-// different scheduledAt values (rare, but the UI allows per-platform
-// times) — for the purpose of the ONE-per-day / TWO-per-day cap we treat
-// the whole video as belonging to the EARLIEST of those days, or "today"
-// if nothing is scheduled (an immediate Post-Now upload).
 const getPrimaryDateStrForPlatforms = (scheduledDates) => {
   const validDates = scheduledDates.filter(Boolean);
   if (!validDates.length) return getCurrentISTDateStr();
@@ -129,6 +106,19 @@ const assertDailyLimitOk = async (user, dateStr, excludeVideoId = null) => {
   }
 };
 
+// Local, read-only token-freshness check — same duplicated pattern used in
+// routes/analytics.js (cron/scheduler.js's internal helper isn't exported).
+const ensureFreshTokenForVideos = async (user) => {
+  const channel = user.youtubeChannel;
+  const isExpired = !channel.tokenExpiryDate || Date.now() > channel.tokenExpiryDate - 60000;
+  if (!isExpired) return channel.accessToken;
+  const credentials = await refreshAccessToken(channel.refreshToken);
+  user.youtubeChannel.accessToken = credentials.access_token;
+  user.youtubeChannel.tokenExpiryDate = credentials.expiry_date;
+  await user.save();
+  return credentials.access_token;
+};
+
 // @route POST /api/videos/upload
 router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
@@ -142,7 +132,6 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       return res.status(400).json({ success: false, message: 'Select at least one platform' });
     }
 
-    // Validate account connection before charging
     for (const p of platformsRequested) {
       if (p === 'youtube' && !user.youtubeChannel) {
         return res.status(400).json({ success: false, message: 'Connect your YouTube channel first', code: 'YOUTUBE_NOT_CONNECTED' });
@@ -155,9 +144,6 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       }
     }
 
-    // Parse per-platform metadata + compute scheduledAt EARLY — before we
-    // charge the user or touch storage — so a bad/too-soon schedule or a
-    // daily-limit breach is rejected with zero cost to the user.
     const postTypeRequested = req.body.postType || 'video';
     const perPlatformMeta = {};
     const scheduledDates = [];
@@ -184,11 +170,9 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       }
     }
 
-    // Business Rule #4: enforce the daily post cap BEFORE charging.
     const primaryDateStr = getPrimaryDateStrForPlatforms(scheduledDates);
     await assertDailyLimitOk(user, primaryDateStr);
 
-    // Charge 1 Free Credit OR 10 Diamonds once for this entire upload action
     const charge = chargeForUpload(user);
 
     const videoFile = req.files.video[0];
@@ -295,10 +279,6 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
 });
 
 // @route POST /api/videos/bulk-upload
-// Business Rules #3 & #4: bulk-scheduled videos always SKIP today and start
-// from TOMORROW, then get auto-assigned across the following days according
-// to the user's plan's daily cap (Free: 1/day, Premium: 2/day) — accounting
-// for anything the user already has scheduled on those days.
 router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res) => {
   try {
     const user = req.user;
@@ -323,16 +303,10 @@ router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res
       }
     }
 
-    // Optional per-file metadata: items[i] -> { title, description, caption, tags, hashtags, category, playlist, audience, privacyStatus }
     const items = parseJson(req.body.items, []);
     const postTypeRequested = req.body.postType || 'video';
-    // Every slot lands on a future calendar day (tomorrow or later), so any
-    // fixed wall-clock time automatically clears the 1-hour buffer rule —
-    // still validated per-slot below as a defensive double-check.
     const preferredTime = /^([01]\d|2[0-3]):[0-5]\d$/.test(req.body.preferredTime || '') ? req.body.preferredTime : '10:00';
 
-    // Fail fast on total credits so we don't charge some videos in the
-    // batch and then reject the rest partway through.
     const availableCredits = user.freeUploadsRemaining + Math.floor(user.diamondBalance / DIAMOND_COST_PER_UPLOAD);
     if (availableCredits < files.length) {
       return res.status(402).json({
@@ -342,7 +316,6 @@ router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res
       });
     }
 
-    // Rule #3: Skip Today entirely — the first bulk video always starts TOMORROW.
     const dailyLimit = getUserDailyPostLimit(user);
     let cursorDateStr = addDaysToDateStr(getCurrentISTDateStr(), 1);
     const slotDateStrs = [];
@@ -351,8 +324,6 @@ router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res
     while (slotDateStrs.length < files.length) {
       safetyCounter += 1;
       if (safetyCounter > files.length + 400) {
-        // Should be unreachable (guards against an infinite loop bug rather
-        // than any expected real-world condition).
         return res.status(500).json({ success: false, message: 'Could not compute bulk schedule slots — please try a smaller batch.' });
       }
       const alreadyOnThisDay = await countUserVideosOnISTDate(user._id, cursorDateStr);
@@ -454,6 +425,77 @@ router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res
   }
 });
 
+// ⚠️ NEW (Boss request — "My Videos" screen): a single combined list of
+// EVERY video the creator has — TubePilot's own queued/uploaded DB
+// records AND real videos live on the connected YouTube channel — with
+// duplicates merged (a DB video that's already live on YouTube is shown
+// once, using the live YouTube copy's title/description/tags/thumbnail as
+// the source of truth, since that's what's actually public).
+//
+// IMPORTANT: this route must stay registered ABOVE '/:id' so Express
+// doesn't try to match "library" as an :id.
+router.get('/library', protect, async (req, res) => {
+  try {
+    const dbVideos = await Video.find({ user: req.user._id }).sort({ createdAt: -1 }).limit(100);
+
+    let ytVideos = [];
+    if (req.user.youtubeChannel) {
+      try {
+        const accessToken = await ensureFreshTokenForVideos(req.user);
+        ytVideos = await listChannelVideos(accessToken);
+      } catch (err) {
+        console.error('⚠️ [Library] Could not fetch YouTube channel videos:', err.message);
+      }
+    }
+
+    const ytByVideoId = {};
+    ytVideos.forEach((v) => { ytByVideoId[v.videoId] = v; });
+    const usedYtIds = new Set();
+
+    const items = [];
+
+    dbVideos.forEach((video) => {
+      const ytTarget = video.platforms.find((p) => p.platform === 'youtube');
+      const ytVideoId = ytTarget?.platformPostId || null;
+      const liveMatch = ytVideoId ? ytByVideoId[ytVideoId] : null;
+      if (liveMatch) usedYtIds.add(ytVideoId);
+
+      items.push({
+        source: liveMatch ? 'both' : 'db',
+        dbId: video._id,
+        ytVideoId,
+        title: liveMatch?.title || ytTarget?.title || '',
+        description: liveMatch?.description || ytTarget?.description || '',
+        tags: liveMatch?.tags || ytTarget?.tags || [],
+        thumbnail: liveMatch?.thumbnail || ytTarget?.thumbnailUrl || '',
+        status: video.status,
+        createdAt: video.createdAt
+      });
+    });
+
+    ytVideos.forEach((v) => {
+      if (usedYtIds.has(v.videoId)) return;
+      items.push({
+        source: 'youtube',
+        dbId: null,
+        ytVideoId: v.videoId,
+        title: v.title,
+        description: v.description,
+        tags: v.tags,
+        thumbnail: v.thumbnail,
+        status: 'uploaded',
+        createdAt: v.publishedAt
+      });
+    });
+
+    items.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    res.json({ success: true, videos: items });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get('/', protect, async (req, res) => {
   try {
     const filter = { user: req.user._id };
@@ -475,16 +517,10 @@ router.get('/:id', protect, async (req, res) => {
   }
 });
 
-// @route PATCH /api/videos/:id/metadata  { platform, title?, description?, caption?, hashtags? }
-// Lets the AI Title/Description generator (and SEO Optimizer) "Apply to
-// Video" flow update a queued video's metadata after upload, instead of
-// only being settable at upload time. Only allowed while that platform's
-// target is still pending/queued — once it's processing, uploaded, or
-// failed, editing metadata here wouldn't reach the destination platform
-// anyway, so it's blocked with a clear reason rather than silently no-oping.
+// ⚠️ UPDATED (Boss request — My Videos edit sheet needs to save tags too)
 router.patch('/:id/metadata', protect, async (req, res) => {
   try {
-    const { platform, title, description, caption, hashtags } = req.body;
+    const { platform, title, description, caption, hashtags, tags } = req.body;
     if (!platform) return res.status(400).json({ success: false, message: 'platform is required' });
 
     const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
@@ -516,9 +552,52 @@ router.patch('/:id/metadata', protect, async (req, res) => {
       target.hashtags = Array.isArray(hashtags) ? hashtags : String(hashtags).split(',').map((h) => h.trim()).filter(Boolean);
       video.aiGenerated.hashtags = true;
     }
+    if (tags !== undefined) {
+      target.tags = Array.isArray(tags) ? tags : String(tags).split(',').map((t) => t.trim()).filter(Boolean);
+      video.aiGenerated.tags = true;
+    }
 
     await video.save();
     res.json({ success: true, message: 'Video updated', video });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ⚠️ NEW (Boss request — "My Videos" thumbnail change, for a video still
+// in TubePilot's own queue/draft). If it's already live on YouTube, the
+// new thumbnail goes straight to YouTube instead of just our own DB copy.
+router.patch('/:id/thumbnail', protect, upload.single('thumbnail'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'thumbnail file is required' });
+
+    const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
+    if (!video) return res.status(404).json({ success: false, message: 'Video not found' });
+
+    const target = video.platforms.find((p) => p.platform === 'youtube');
+    if (!target) return res.status(404).json({ success: false, message: 'This video has no YouTube target' });
+
+    if (target.platformPostId && req.user.youtubeChannel) {
+      const { setThumbnail } = require('../utils/youtube');
+      const { Readable } = require('stream');
+      const accessToken = await ensureFreshTokenForVideos(req.user);
+      await setThumbnail({
+        accessToken,
+        refreshToken: req.user.youtubeChannel.refreshToken,
+        videoId: target.platformPostId,
+        thumbnailStream: Readable.from(req.file.buffer)
+      });
+    } else {
+      const thumbUpload = await uploadBufferToCloudinary(
+        require('../utils/cloudinary').account1,
+        req.file.buffer,
+        { resource_type: 'image', public_id: `${req.user.userId}_thumb_${Date.now()}` }
+      );
+      target.thumbnailUrl = thumbUpload.secure_url;
+      await video.save();
+    }
+
+    res.json({ success: true, message: 'Thumbnail updated' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -529,9 +608,6 @@ router.patch('/:id/schedule/:platform', protect, async (req, res) => {
     const { scheduledAt } = req.body;
     if (!scheduledAt) return res.status(400).json({ success: false, message: 'scheduledAt is required' });
 
-    // Business Rule #2: enforce the 1-hour buffer here too, not just on
-    // initial upload — rescheduling to "5 minutes from now" would defeat
-    // the whole point of the buffer.
     try {
       assertScheduleBufferOk(scheduledAt);
     } catch (bufferErr) {
@@ -544,8 +620,6 @@ router.patch('/:id/schedule/:platform', protect, async (req, res) => {
     const target = video.platforms.find((p) => p.platform === req.params.platform);
     if (!target) return res.status(404).json({ success: false, message: 'Platform target not found on this video' });
 
-    // Business Rule #4: moving this video to a new day must still respect
-    // the daily cap for that day (excluding this same video's own slot).
     try {
       await assertDailyLimitOk(req.user, toISTDateStr(scheduledAt), video._id);
     } catch (limitErr) {
@@ -575,15 +649,35 @@ router.patch('/:id/schedule/:platform', protect, async (req, res) => {
   }
 });
 
+// ⚠️ UPDATED (Boss request — "My Videos" delete must remove BOTH the
+// TubePilot record AND the real YouTube video): previously blocked
+// deleting an already fully-uploaded video entirely. That restriction is
+// now removed — if this video has a live YouTube target, it's deleted
+// from YouTube first, then the TubePilot record is removed. A YouTube
+// delete failure (already gone, dead token) never blocks cleaning up the
+// local record — the user's "Delete" action should always finish.
 router.delete('/:id', protect, async (req, res) => {
   try {
     const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
     if (!video) return res.status(404).json({ success: false, message: 'Video not found' });
-    if (video.status === 'uploaded') {
-      return res.status(400).json({ success: false, message: 'Cannot delete an already fully-uploaded video' });
+
+    const ytTarget = video.platforms.find((p) => p.platform === 'youtube' && p.platformPostId);
+    if (ytTarget && req.user.youtubeChannel) {
+      try {
+        const accessToken = await ensureFreshTokenForVideos(req.user);
+        await deleteVideoFromYoutube({
+          accessToken,
+          refreshToken: req.user.youtubeChannel.refreshToken,
+          videoId: ytTarget.platformPostId
+        });
+      } catch (err) {
+        console.error('⚠️ [Video Delete] YouTube delete failed, continuing with local delete:', err.message);
+      }
     }
 
-    if (!video.refundIssued) {
+    // Only refund credits for a video that never actually finished
+    // publishing — an already-live video's credit was legitimately spent.
+    if (!video.refundIssued && video.status !== 'uploaded') {
       if (video.usedFreeUpload) {
         req.user.freeUploadsRemaining += 1;
       } else if (video.diamondsCharged > 0) {
@@ -596,11 +690,11 @@ router.delete('/:id', protect, async (req, res) => {
     await Notification.create({
       user: req.user._id,
       type: 'upload_failed',
-      title: 'Upload Cancelled',
-      message: 'Your upload was cancelled and your credit/diamonds were refunded.'
+      title: 'Video Deleted',
+      message: 'Your video was deleted from TubePilot and YouTube.'
     });
 
-    res.json({ success: true, message: 'Video cancelled and credit refunded' });
+    res.json({ success: true, message: 'Video deleted' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
