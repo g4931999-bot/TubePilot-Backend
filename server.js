@@ -88,6 +88,7 @@ app.use('/api/facebook', metaRoutes);
 app.use('/api/meta/facebook', metaRoutes);
 
 // Video Routes
+app.use('/', require('./routes/share'));
 app.use('/api/videos', videoRoutes);
 app.use('/api/video', videoRoutes);
 
