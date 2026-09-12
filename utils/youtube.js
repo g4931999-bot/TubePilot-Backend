@@ -8,14 +8,12 @@ const getOAuthClient = () => {
   );
 };
 
-// Exchanges the authorization code (from frontend Google consent screen) for tokens
 const exchangeCodeForTokens = async (code) => {
   const oauth2Client = getOAuthClient();
   const { tokens } = await oauth2Client.getToken(code);
-  return tokens; // { access_token, refresh_token, expiry_date, ... }
+  return tokens;
 };
 
-// Refreshes access token using stored refresh token
 const refreshAccessToken = async (refreshToken) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ refresh_token: refreshToken });
@@ -31,7 +29,6 @@ const getChannelInfo = async (accessToken) => {
   return res.data.items && res.data.items[0];
 };
 
-// Uploads a readable stream to the connected YouTube channel
 const uploadVideoToYouTube = async ({ accessToken, refreshToken, fileStream, title, description, tags, categoryId, privacyStatus, publishAt, madeForKids }) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
@@ -49,7 +46,7 @@ const uploadVideoToYouTube = async ({ accessToken, refreshToken, fileStream, tit
     },
     media: { body: fileStream }
   });
-  return res.data; // includes id
+  return res.data;
 };
 
 const setThumbnail = async ({ accessToken, refreshToken, videoId, thumbnailStream }) => {
@@ -59,35 +56,24 @@ const setThumbnail = async ({ accessToken, refreshToken, videoId, thumbnailStrea
   return youtube.thumbnails.set({ videoId, media: { body: thumbnailStream } });
 };
 
-// Switches an already-uploaded video's privacy status (e.g. unlisted -> public)
-// without re-uploading the file. Used by cron/scheduler.js to publish a video
-// that was uploaded unlisted and scheduled to go public later.
 const updateVideoPrivacy = async ({ accessToken, refreshToken, videoId, privacyStatus }) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
   const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
   const res = await youtube.videos.update({
     part: 'status',
-    requestBody: {
-      id: videoId,
-      status: { privacyStatus }
-    }
+    requestBody: { id: videoId, status: { privacyStatus } }
   });
   return res.data;
 };
 
-// ⚠️ NEW (Boss request — Option B, "Apply to Video" should also cover
-// already-published channel videos, not just TubePilot's own queued
-// uploads): fetches the connected channel's real videos straight from
-// YouTube — same data the creator sees in YouTube Studio.
-//
-// Two-step approach because playlistItems.list (the "uploads" playlist)
-// is the cheapest way to enumerate a channel's videos, but doesn't
-// reliably include privacyStatus — so this only pulls what's needed for
-// a picker list (id/title/description/thumbnail/publishedAt). If a
-// caller later needs privacyStatus too, add a videos.list(part:'status')
-// pass over the returned ids — not done here to keep this to one API
-// round-trip pair (channels.list + playlistItems.list) per call.
+// ⚠️ UPDATED (Boss request — "My Videos" screen needs tags too, for
+// editing): playlistItems.list's snippet does NOT include tags, only
+// videos.list's snippet does — so this now makes a second batched call
+// (one videos.list for up to `maxResults` ids) to pull tags/description
+// alongside title/thumbnail. Still just 2 API calls total per screen
+// load (channels.list + playlistItems.list + videos.list = 3, but all
+// cheap/quota-light list calls).
 const listChannelVideos = async (accessToken, { maxResults = 25 } = {}) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken });
@@ -103,22 +89,30 @@ const listChannelVideos = async (accessToken, { maxResults = 25 } = {}) => {
     maxResults
   });
 
-  return (itemsRes.data.items || []).map((item) => ({
-    videoId: item.snippet.resourceId.videoId,
-    title: item.snippet.title,
-    description: item.snippet.description,
-    thumbnail: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
-    publishedAt: item.snippet.publishedAt
-  }));
+  const videoIds = (itemsRes.data.items || []).map((i) => i.snippet.resourceId.videoId).filter(Boolean);
+  if (!videoIds.length) return [];
+
+  const videosRes = await youtube.videos.list({ part: 'snippet', id: videoIds.join(',') });
+  const detailsById = {};
+  (videosRes.data.items || []).forEach((v) => { detailsById[v.id] = v.snippet; });
+
+  return videoIds.map((videoId) => {
+    const snippet = detailsById[videoId] || {};
+    return {
+      videoId,
+      title: snippet.title || '',
+      description: snippet.description || '',
+      tags: snippet.tags || [],
+      thumbnail: snippet.thumbnails?.medium?.url || snippet.thumbnails?.default?.url || '',
+      publishedAt: snippet.publishedAt || null
+    };
+  });
 };
 
-// ⚠️ NEW (Boss request — Option B): updates title/description directly on
-// an already-published/live YouTube video (NOT TubePilot's own DB record —
-// this is a real YouTube API write). videos.update requires the FULL
-// snippet object (categoryId is mandatory), so this fetches the video's
-// current snippet first and merges in only the fields that changed,
-// leaving tags/categoryId/everything else exactly as they were.
-const updateVideoMetadataOnYoutube = async ({ accessToken, refreshToken, videoId, title, description }) => {
+// ⚠️ UPDATED (Boss request — My Videos edit sheet needs to save tags
+// too): now merges `tags` into the snippet alongside title/description,
+// same "fetch current snippet, merge only what changed" pattern as before.
+const updateVideoMetadataOnYoutube = async ({ accessToken, refreshToken, videoId, title, description, tags }) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
   const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
@@ -134,7 +128,8 @@ const updateVideoMetadataOnYoutube = async ({ accessToken, refreshToken, videoId
   const mergedSnippet = {
     ...existing.snippet,
     ...(title !== undefined && title !== null ? { title } : {}),
-    ...(description !== undefined && description !== null ? { description } : {})
+    ...(description !== undefined && description !== null ? { description } : {}),
+    ...(tags !== undefined && tags !== null ? { tags } : {})
   };
 
   const res = await youtube.videos.update({
@@ -144,14 +139,18 @@ const updateVideoMetadataOnYoutube = async ({ accessToken, refreshToken, videoId
   return res.data;
 };
 
-// Detects Google's "invalid_grant" response, which means the refresh token
-// itself is dead (user revoked access in their Google Account, token expired
-// from 6 months of inactivity, or the OAuth consent was reset). This is NOT
-// a transient network/API error — retrying won't help, the user must
-// reconnect their YouTube account. Used by cron/scheduler.js's
-// ensureFreshYouTubeToken() to decide between "stop retrying, ask user to
-// reconnect" vs "transient error, retry as normal". Also now used by the
-// new /my-videos and /my-videos/:id routes for the same reason.
+// ⚠️ NEW (Boss request — "My Videos" delete must remove the REAL YouTube
+// video, not just TubePilot's own record): permanently deletes a video
+// from the connected channel via the YouTube Data API. This is
+// irreversible on YouTube's side — the calling route is responsible for
+// any confirmation UX before reaching this.
+const deleteVideoFromYoutube = async ({ accessToken, refreshToken, videoId }) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+  await youtube.videos.delete({ id: videoId });
+};
+
 const isInvalidGrantError = (err) => {
   const code = err?.response?.data?.error;
   const description = err?.response?.data?.error_description || err?.message || '';
@@ -161,6 +160,6 @@ const isInvalidGrantError = (err) => {
 module.exports = {
   getOAuthClient, exchangeCodeForTokens, refreshAccessToken,
   getChannelInfo, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy,
-  listChannelVideos, updateVideoMetadataOnYoutube,
+  listChannelVideos, updateVideoMetadataOnYoutube, deleteVideoFromYoutube,
   isInvalidGrantError
 };
