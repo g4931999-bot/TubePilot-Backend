@@ -163,4 +163,4 @@ module.exports = {
   getChannelInfo, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy,
   listChannelVideos, updateVideoMetadataOnYoutube,
   isInvalidGrantError
-};s
+};
