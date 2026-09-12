@@ -9,17 +9,26 @@ const GiftCode = require('../models/GiftCode');
 
 const router = express.Router();
 
-// Fixed packages: 1 Diamond = ₹1, only these 4 sizes are sold
-const DIAMOND_PACKAGES = [10, 50, 100, 200];
+// ⚠️ BOSS UPDATE: pricing is no longer 1 Diamond = ₹1. Each package now has
+// its own diamonds amount + price — only these 4 sizes are sold.
+//   ₹10  → 99 diamonds
+//   ₹50  → 299 diamonds
+//   ₹100 → 599 diamonds
+//   ₹200 → 799 diamonds
+const DIAMOND_PACKAGES = [
+  { diamonds: 99, priceINR: 10 },
+  { diamonds: 299, priceINR: 50 },
+  { diamonds: 599, priceINR: 100 },
+  { diamonds: 799, priceINR: 200 },
+];
 
 // @route GET /api/diamonds/packages
 router.get('/packages', protect, (req, res) => {
-  const packages = DIAMOND_PACKAGES.map((d) => ({ diamonds: d, priceINR: d }));
   // The app reads this to decide CFEnvironment.SANDBOX vs .PRODUCTION at
   // runtime — so switching environments is purely a backend .env change
   // (CASHFREE_ENV=SANDBOX/PRODUCTION + matching keys) + server restart.
   // No Flutter rebuild ever needed for this.
-  res.json({ success: true, packages, currentBalance: req.user.diamondBalance, cashfreeEnvironment: CASHFREE_ENV });
+  res.json({ success: true, packages: DIAMOND_PACKAGES, currentBalance: req.user.diamondBalance, cashfreeEnvironment: CASHFREE_ENV });
 });
 
 /**
@@ -72,14 +81,20 @@ const creditApprovedTransaction = async (transactionId, source) => {
  */
 const handleCreateOrder = async (req, res) => {
   try {
-    // Accepts 'diamondPackage', 'packageId', or 'amount' to ensure full frontend compatibility
+    // Accepts 'diamondPackage', 'packageId', or 'amount' to ensure full frontend compatibility.
+    // ⚠️ BOSS UPDATE: the app sends the DIAMONDS amount (e.g. 99/299/599/799)
+    // here, not a price — since price no longer equals diamonds 1:1, we
+    // look up the matching package to find what to actually charge.
     const rawPackage = req.body.diamondPackage || req.body.packageId || req.body.amount;
-    const diamondPackage = Number(rawPackage);
+    const requestedDiamonds = Number(rawPackage);
 
-    if (!DIAMOND_PACKAGES.includes(diamondPackage)) {
+    const pkg = DIAMOND_PACKAGES.find((p) => p.diamonds === requestedDiamonds);
+
+    if (!pkg) {
+      const validOptions = DIAMOND_PACKAGES.map((p) => p.diamonds).join(', ');
       return res.status(400).json({ 
         success: false, 
-        message: 'Invalid diamond package selection. Choose 10, 50, 100 or 200.' 
+        message: `Invalid diamond package selection. Choose ${validOptions} diamonds.` 
       });
     }
 
@@ -91,8 +106,8 @@ const handleCreateOrder = async (req, res) => {
       user: req.user._id,
       userDisplayId: userIdentifier,
       type: 'diamond_purchase',
-      diamondPackage,
-      amountINR: diamondPackage, // 1 diamond = ₹1
+      diamondPackage: pkg.diamonds, // diamonds credited on approval
+      amountINR: pkg.priceINR,      // actual rupees charged (no longer 1:1 with diamonds)
       status: 'pending',
       paymentMethod: 'cashfree',
       cashfreeOrderId: orderId
@@ -100,7 +115,7 @@ const handleCreateOrder = async (req, res) => {
 
     const order = await createCashfreeOrder({
       orderId,
-      amount: diamondPackage,
+      amount: pkg.priceINR,
       customerId: userIdentifier,
       customerPhone: req.user.phone,
       customerEmail: req.user.email,
@@ -110,7 +125,7 @@ const handleCreateOrder = async (req, res) => {
     transaction.paymentSessionId = order.paymentSessionId;
     await transaction.save();
 
-    console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${orderId}, amount=₹${diamondPackage}`);
+    console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${orderId}, amount=₹${pkg.priceINR}, diamonds=${pkg.diamonds}`);
 
     res.status(201).json({
       success: true,
