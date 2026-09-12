@@ -219,6 +219,23 @@ const ensureFreshTokenForAudit = async (user) => {
   }
 };
 
+// ⚠️ NEW (Boss request — real, actionable channel-profile gaps): builds a
+// short, ready-to-use AI prompt for each detected gap. These are plain
+// rule-based templates (not an extra AI/LLM call) — fast, free to compute,
+// and don't depend on any AI provider being up. The frontend shows only a
+// blurred/truncated preview of this text + a Copy button and a "Gemini"
+// button — both gated behind Diamond Store, per Boss's monetization model
+// (₹10/month plan) — so the prompt text itself is real and useful, just
+// not usable for free.
+const buildDescriptionPrompt = (channelTitle) =>
+  `Write a compelling, SEO-friendly YouTube channel description for a channel named "${channelTitle}". Explain what viewers can expect, how often new videos are posted, and end with a clear call-to-action to subscribe. Keep it under 1000 characters and make it sound natural, not like a list of keywords.`;
+
+const buildBannerPrompt = (channelTitle) =>
+  `Create a professional, eye-catching YouTube channel banner for a channel named "${channelTitle}". Canvas size 2560x1440px, keep all important text and logo inside the safe area (1546x423px, centered). Use bold, readable typography, a color palette that matches the channel's tone, and leave clean negative space so it doesn't look cluttered on mobile.`;
+
+const buildNamePrompt = (channelTitle) =>
+  `Suggest 5 short, brandable, easy-to-remember YouTube channel name ideas as alternatives to "${channelTitle}", along with a matching @handle for each. Keep names under 20 characters, avoid random numbers, and make sure they hint at the channel's niche.`;
+
 // @route GET /api/analytics/audit
 // Channel health: engagement %, weekly Short-to-Long video ratio (Shorts =
 // duration <= 60s), and a few actionable, rule-based recommendations. Pulls
@@ -226,6 +243,13 @@ const ensureFreshTokenForAudit = async (user) => {
 // Data API (statistics + contentDetails are public fields, but calling as
 // the authenticated owner avoids a second API-key dependency for the
 // user's own channel).
+//
+// ⚠️ UPDATED (Boss request): now also pulls `snippet` + `brandingSettings`
+// so real channel-profile gaps (missing/short description, missing banner,
+// no custom handle/name set) can be detected — not just activity metrics.
+// `recommendations` is now an array of OBJECTS ({ type, message, prompt })
+// instead of plain strings, so the frontend can render an actionable
+// prompt-preview + Copy/Gemini buttons for the gaps that have one.
 router.get('/audit', protect, async (req, res) => {
   try {
     if (!req.user.youtubeChannel) {
@@ -237,7 +261,7 @@ router.get('/audit', protect, async (req, res) => {
     oauth2Client.setCredentials({ access_token: accessToken });
     const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
-    const channelRes = await youtube.channels.list({ part: 'statistics,contentDetails', mine: true });
+    const channelRes = await youtube.channels.list({ part: 'snippet,statistics,contentDetails,brandingSettings', mine: true });
     const channel = channelRes.data.items && channelRes.data.items[0];
     if (!channel) return res.status(404).json({ success: false, message: 'YouTube channel not found' });
 
@@ -285,17 +309,69 @@ router.get('/audit', protect, async (req, res) => {
       }
     }
 
+    const channelTitle = channel.snippet?.title || 'your channel';
     const recommendations = [];
+
+    // ---- Activity/engagement gaps (unchanged logic, now object-shaped) ----
     if (engagementPct !== null && engagementPct < 2) {
-      recommendations.push('Engagement is under 2% — try asking a direct question in your first comment or video hook to prompt replies.');
+      recommendations.push({
+        type: 'engagement',
+        message: 'Engagement is under 2% — try asking a direct question in your first comment or video hook to prompt replies.',
+        prompt: null
+      });
     }
     if (recentVideoCount === 0) {
-      recommendations.push('No uploads in the last 7 days — consistency is one of the biggest ranking signals on YouTube.');
+      recommendations.push({
+        type: 'uploads',
+        message: 'No uploads in the last 7 days — consistency is one of the biggest ranking signals on YouTube.',
+        prompt: null
+      });
     }
     if (shortToLongRatio !== null && shortToLongRatio === 0 && recentVideoCount > 0) {
-      recommendations.push('You posted zero Shorts this week — Shorts are currently the fastest way to reach new subscribers.');
+      recommendations.push({
+        type: 'shorts',
+        message: 'You posted zero Shorts this week — Shorts are currently the fastest way to reach new subscribers.',
+        prompt: null
+      });
     }
-    if (recommendations.length === 0) recommendations.push('Your channel activity looks healthy — keep up the current posting cadence.');
+
+    // ---- NEW: real channel-profile gaps (description / banner / name) ----
+    const description = channel.snippet?.description || '';
+    if (description.trim().length < 50) {
+      recommendations.push({
+        type: 'description',
+        message: 'Your channel description is missing or too short — a clear description helps YouTube understand your channel and improves search ranking.',
+        prompt: buildDescriptionPrompt(channelTitle)
+      });
+    }
+
+    const hasBanner = !!channel.brandingSettings?.image?.bannerExternalUrl;
+    if (!hasBanner) {
+      recommendations.push({
+        type: 'banner',
+        message: 'Your channel has no banner image — a banner is the first visual impression for new visitors landing on your channel.',
+        prompt: buildBannerPrompt(channelTitle)
+      });
+    }
+
+    // customUrl (the @handle) is only set once a channel has claimed a
+    // proper handle — its absence is a reliable, real signal that the
+    // channel name/branding hasn't been optimized yet.
+    if (!channel.snippet?.customUrl) {
+      recommendations.push({
+        type: 'title',
+        message: 'Your channel doesn\'t have a custom handle set yet — a clear, brandable name and handle make you easier to find and remember.',
+        prompt: buildNamePrompt(channelTitle)
+      });
+    }
+
+    if (recommendations.length === 0) {
+      recommendations.push({
+        type: 'healthy',
+        message: 'Your channel activity looks healthy — keep up the current posting cadence.',
+        prompt: null
+      });
+    }
 
     res.json({
       success: true,
