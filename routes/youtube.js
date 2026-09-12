@@ -1,7 +1,10 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { protect } = require('../middleware/auth');
-const { getOAuthClient, exchangeCodeForTokens, getChannelInfo } = require('../utils/youtube');
+const {
+  getOAuthClient, exchangeCodeForTokens, refreshAccessToken, getChannelInfo,
+  listChannelVideos, updateVideoMetadataOnYoutube, isInvalidGrantError
+} = require('../utils/youtube');
 const User = require('../models/User');
 
 const router = express.Router();
@@ -27,6 +30,23 @@ const pickChannelThumbnail = (snippet) =>
   snippet?.thumbnails?.medium?.url ||
   snippet?.thumbnails?.default?.url ||
   '';
+
+// ⚠️ NEW (Boss request — Option B): if the stored access token is expired
+// (or about to expire in the next 60s), refresh it via the stored refresh
+// token and persist the new token/expiry on the user doc. Shared by both
+// new routes below so a creator's channel access never silently fails
+// mid-session just because the token aged out.
+const ensureFreshAccessToken = async (user) => {
+  const { accessToken, refreshToken, tokenExpiryDate } = user.youtubeChannel;
+  const isExpiringSoon = tokenExpiryDate && Date.now() > tokenExpiryDate - 60000;
+  if (!isExpiringSoon) return accessToken;
+
+  const creds = await refreshAccessToken(refreshToken);
+  user.youtubeChannel.accessToken = creds.access_token;
+  user.youtubeChannel.tokenExpiryDate = creds.expiry_date;
+  await user.save();
+  return creds.access_token;
+};
 
 // @route GET /api/youtube/oauth/url?platform=mobile|web
 // Returns the Google consent URL. We encode the user's id + platform in `state` (signed) so the
@@ -102,6 +122,53 @@ router.get('/channel', protect, async (req, res) => {
   }
   const { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } = req.user.youtubeChannel;
   res.json({ success: true, channel: { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } });
+});
+
+// @route GET /api/youtube/my-videos
+// ⚠️ NEW (Boss request — Option B): real videos straight from the
+// connected YouTube channel — includes already-published videos, unlike
+// GET /api/videos?status=queued which only knows about videos uploaded
+// through TubePilot itself.
+router.get('/my-videos', protect, async (req, res) => {
+  try {
+    if (!req.user.youtubeChannel) {
+      return res.status(404).json({ success: false, message: 'No YouTube channel connected' });
+    }
+    const accessToken = await ensureFreshAccessToken(req.user);
+    const videos = await listChannelVideos(accessToken);
+    res.json({ success: true, videos });
+  } catch (err) {
+    if (isInvalidGrantError(err)) {
+      return res.status(401).json({ success: false, code: 'YOUTUBE_RECONNECT_REQUIRED', message: 'Your YouTube connection expired — please reconnect your channel.' });
+    }
+    res.status(500).json({ success: false, message: err.message || 'Could not load channel videos' });
+  }
+});
+
+// @route PATCH /api/youtube/my-videos/:videoId
+// ⚠️ NEW (Boss request — Option B): writes title/description straight to
+// an already-live YouTube video via the YouTube Data API — separate from
+// PATCH /api/videos/:id/metadata, which only updates TubePilot's own DB
+// record for videos it uploaded itself.
+router.patch('/my-videos/:videoId', protect, async (req, res) => {
+  try {
+    if (!req.user.youtubeChannel) {
+      return res.status(404).json({ success: false, message: 'No YouTube channel connected' });
+    }
+    const { title, description } = req.body;
+    if (!title && !description) {
+      return res.status(400).json({ success: false, message: 'Provide a title and/or description to update' });
+    }
+    const accessToken = await ensureFreshAccessToken(req.user);
+    const { refreshToken } = req.user.youtubeChannel;
+    const updated = await updateVideoMetadataOnYoutube({ accessToken, refreshToken, videoId: req.params.videoId, title, description });
+    res.json({ success: true, video: updated });
+  } catch (err) {
+    if (isInvalidGrantError(err)) {
+      return res.status(401).json({ success: false, code: 'YOUTUBE_RECONNECT_REQUIRED', message: 'Your YouTube connection expired — please reconnect your channel.' });
+    }
+    res.status(err.status || 500).json({ success: false, message: err.message || 'Could not update this video' });
+  }
 });
 
 module.exports = router;
