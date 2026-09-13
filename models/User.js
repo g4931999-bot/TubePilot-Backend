@@ -1,11 +1,20 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
+// ⚠️ NEW (Boss request — channel-category personalization for the AI Idea
+// popup): `category` added here so routes/youtube.js's OAuth callback can
+// actually persist the niche it detects via extractNicheFromTopics() (see
+// utils/youtube.js). This schema is strict by default like the rest of the
+// User model — without this field declared, `user.youtubeChannel.category
+// = '...'` would be silently dropped on save (never persisted, no error),
+// same class of bug the MetaPendingPageSchema comment below already warns
+// about.
 const YouTubeChannelSchema = new mongoose.Schema({
   channelId: String,
   channelTitle: String,
   thumbnail: String,
   subscriberCount: String,
+  category: { type: String, default: null },
   accessToken: String,
   refreshToken: String,
   tokenExpiryDate: Number,
