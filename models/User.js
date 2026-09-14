@@ -1,14 +1,6 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
-// ⚠️ NEW (Boss request — channel-category personalization for the AI Idea
-// popup): `category` added here so routes/youtube.js's OAuth callback can
-// actually persist the niche it detects via extractNicheFromTopics() (see
-// utils/youtube.js). This schema is strict by default like the rest of the
-// User model — without this field declared, `user.youtubeChannel.category
-// = '...'` would be silently dropped on save (never persisted, no error),
-// same class of bug the MetaPendingPageSchema comment below already warns
-// about.
 const YouTubeChannelSchema = new mongoose.Schema({
   channelId: String,
   channelTitle: String,
@@ -52,12 +44,6 @@ const ConnectedInstagramSchema = new mongoose.Schema({
   connectedAt: { type: Date, default: Date.now }
 }, { _id: false });
 
-// Temporary holding area for a user's Facebook Pages when they have more
-// than one linked to their account, until they pick which one to connect
-// via PATCH /api/meta/select-page. NOTE: this field MUST be declared here —
-// Mongoose is strict by default, so calling user.set('metaPendingPages', ...)
-// on an undeclared path is silently dropped (never persisted), which used
-// to make multi-page selection always fail with "Page not found".
 const MetaPendingPageSchema = new mongoose.Schema({
   id: String,
   name: String,
@@ -84,7 +70,7 @@ const UserSchema = new mongoose.Schema({
   referredBy: { type: String, default: null },
   diamondBalance: { type: Number, default: 0 },
   autoRefillDiamonds: { type: Boolean, default: false },
-  freeUploadsRemaining: { type: Number, default: 20 }, // 20 Free Upload Credits
+  freeUploadsRemaining: { type: Number, default: 20 },
   freeUploadsResetAt: { type: Date, default: () => new Date(new Date().setMonth(new Date().getMonth() + 1)) },
   storageUsedBytes: { type: Number, default: 0 },
   fcmTokens: [{ type: String }],
@@ -100,6 +86,18 @@ const UserSchema = new mongoose.Schema({
     plan: { type: String, default: null },
     expiresAt: { type: Date, default: null }
   },
+
+  // ⚠️ NEW (Boss request — plan/quota system, replaces "same features at
+  // every price" issue): whichever Diamond Store package the user last
+  // purchased decides feature access, not just wallet balance. Set only
+  // inside creditApprovedTransaction() in routes/diamond.js at the moment
+  // a purchase is approved — never incremented, always REPLACED, since a
+  // new purchase means a new plan (see routes/diamond.js comment).
+  activeTier: { type: Number, default: 0 }, // 0 = no plan yet, 1..4 = package index+1
+  thumbnailPromptsRemaining: { type: Number, default: 0 },
+  seoScoreLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
+  competitorLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
+
   refreshTokens: [{ type: String }],
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
   isActive: { type: Boolean, default: true }
