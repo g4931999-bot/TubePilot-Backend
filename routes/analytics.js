@@ -7,10 +7,6 @@ const { fetchCompetitorStats } = require('../utils/youtubePublic');
 const { google } = require('googleapis');
 const router = express.Router();
 
-// @route GET /api/analytics
-// Note: real "Views / Watch Time / CTR / Subscribers" numbers must come from the
-// YouTube Analytics API (youtubeAnalytics.reports.query) using the connected channel's
-// access token — plug that call in here once the channel has enough data.
 router.get('/', protect, async (req, res) => {
   try {
     const userId = req.user._id;
@@ -22,19 +18,16 @@ router.get('/', protect, async (req, res) => {
       Video.countDocuments({ user: userId, status: 'uploaded' }),
       Video.countDocuments({ user: userId, status: 'queued' }),
       Video.countDocuments({ user: userId, status: 'failed' }),
-      // Daily upload counts for the last 14 days, for the trend chart
       Video.aggregate([
         { $match: { user: userId, status: 'uploaded', createdAt: { $gte: fourteenDaysAgo } } },
         { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } }
       ]),
-      // Most recent 15 videos, for the activity/usage list
       Video.find({ user: userId })
         .sort({ createdAt: -1 })
         .limit(15)
         .select('title status diamondsCharged usedFreeUpload createdAt')
     ]);
 
-    // Build a full 14-day array (including zero-count days) so the chart has consistent x-axis points
     const trendMap = {};
     trendRows.forEach((r) => { trendMap[r._id] = r.count; });
     const uploadTrend = [];
@@ -62,22 +55,6 @@ router.get('/', protect, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Competitor Tracking
-// ---------------------------------------------------------------------------
-
-// @route GET /api/analytics/competitors/search?q=tube
-// Live channel-name search for the "add competitor" autocomplete — used by
-// the Competitor Radar screen's search field so the user can type a partial
-// name (e.g. "tube") and pick from real matching YouTube channels instead
-// of typing an exact @handle or channel ID.
-//
-// Uses YouTube Data API's public search.list (type=channel) with the same
-// YOUTUBE_DATA_API_KEY the app already relies on for public stats (see
-// utils/youtubePublic.js) — no separate credential needed.
-//
-// IMPORTANT: this route must stay registered ABOVE any '/competitors/:id'
-// style route, otherwise Express would try to match "search" as an :id.
 router.get('/competitors/search', protect, async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
@@ -110,11 +87,6 @@ router.get('/competitors/search', protect, async (req, res) => {
   }
 });
 
-// @route GET /api/analytics/competitors
-// Lists this user's tracked competitors. Any competitor whose cached stats
-// are missing or older than 6 hours gets refreshed inline before returning
-// (best-effort — a refresh failure for one competitor never blocks the rest
-// of the list, it just carries its previous cache + an `error` note).
 router.get('/competitors', protect, async (req, res) => {
   try {
     const competitors = await Competitor.find({ user: req.user._id }).sort({ createdAt: -1 });
@@ -125,7 +97,7 @@ router.get('/competitors', protect, async (req, res) => {
         const isStale = !c.lastStats?.fetchedAt || Date.now() - new Date(c.lastStats.fetchedAt).getTime() > STALE_MS;
         if (!isStale) return;
         try {
-          c.lastStats = await fetchCompetitorStats({ channelId: c.channelId, handle: c.handle });
+          c.lastStats = await fetchCompetitorStats({ channelId: c.channelId, handle: c.handle, mode: req.user.competitorLevel });
           await c.save();
         } catch (err) {
           c.lastStats = { ...(c.lastStats?.toObject ? c.lastStats.toObject() : c.lastStats), error: err.message, fetchedAt: c.lastStats?.fetchedAt || null };
@@ -134,15 +106,33 @@ router.get('/competitors', protect, async (req, res) => {
       })
     );
 
-    res.json({ success: true, competitors });
+    // ⚠️ NEW: basic-tier users only see subscriberCount/viewCount/videoCount
+    // — the deeper VPH/trend signal is stripped from the response for them
+    // (still gated even if a stale cache had it from a previous higher plan).
+    const responseCompetitors = req.user.competitorLevel === 'basic'
+      ? competitors.map((c) => {
+          const obj = c.toObject();
+          if (obj.lastStats) obj.lastStats.vph = null;
+          return obj;
+        })
+      : competitors;
+
+    res.json({ success: true, competitors: responseCompetitors, competitorLevel: req.user.competitorLevel });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
 // @route POST /api/analytics/competitors  { channelId?, handle?, label? }
+// ⚠️ UPDATED (Boss request — plan/quota system): gated behind
+// req.user.competitorLevel — tier 1 buyers ('none') cannot add any
+// competitor at all now.
 router.post('/competitors', protect, async (req, res) => {
   try {
+    if (req.user.competitorLevel === 'none') {
+      return res.status(402).json({ success: false, message: 'Competitor Analysis is not included in your current plan. Please upgrade from the Diamond Store.', code: 'PLAN_UPGRADE_REQUIRED' });
+    }
+
     const { channelId, handle, label } = req.body;
     if (!channelId && !handle) {
       return res.status(400).json({ success: false, message: 'Provide either channelId or handle' });
@@ -163,10 +153,8 @@ router.post('/competitors', protect, async (req, res) => {
       label: label || handle || channelId
     });
 
-    // Best-effort first fetch so the UI has stats immediately instead of
-    // showing "pending" until the next GET refresh cycle.
     try {
-      competitor.lastStats = await fetchCompetitorStats({ channelId, handle });
+      competitor.lastStats = await fetchCompetitorStats({ channelId, handle, mode: req.user.competitorLevel });
       if (!competitor.label && competitor.lastStats.resolvedChannelId) competitor.label = handle || channelId;
       await competitor.save();
     } catch (err) {
@@ -180,7 +168,6 @@ router.post('/competitors', protect, async (req, res) => {
   }
 });
 
-// @route DELETE /api/analytics/competitors/:id
 router.delete('/competitors/:id', protect, async (req, res) => {
   try {
     const competitor = await Competitor.findOneAndDelete({ _id: req.params.id, user: req.user._id });
@@ -191,14 +178,6 @@ router.delete('/competitors/:id', protect, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Channel Audit
-// ---------------------------------------------------------------------------
-
-// Local, read-only token-freshness check — deliberately NOT reusing
-// cron/scheduler.js's ensureFreshYouTubeToken (unexported, and scheduling
-// logic must stay untouched) — this duplicates ~8 lines instead of
-// widening the scheduler's surface area for a read-only analytics call.
 const ensureFreshTokenForAudit = async (user) => {
   const channel = user.youtubeChannel;
   const isExpired = !channel.tokenExpiryDate || Date.now() > channel.tokenExpiryDate - 60000;
@@ -219,14 +198,6 @@ const ensureFreshTokenForAudit = async (user) => {
   }
 };
 
-// ⚠️ NEW (Boss request — real, actionable channel-profile gaps): builds a
-// short, ready-to-use AI prompt for each detected gap. These are plain
-// rule-based templates (not an extra AI/LLM call) — fast, free to compute,
-// and don't depend on any AI provider being up. The frontend shows only a
-// blurred/truncated preview of this text + a Copy button and a "Gemini"
-// button — both gated behind Diamond Store, per Boss's monetization model
-// (₹10/month plan) — so the prompt text itself is real and useful, just
-// not usable for free.
 const buildDescriptionPrompt = (channelTitle) =>
   `Write a compelling, SEO-friendly YouTube channel description for a channel named "${channelTitle}". Explain what viewers can expect, how often new videos are posted, and end with a clear call-to-action to subscribe. Keep it under 1000 characters and make it sound natural, not like a list of keywords.`;
 
@@ -236,20 +207,6 @@ const buildBannerPrompt = (channelTitle) =>
 const buildNamePrompt = (channelTitle) =>
   `Suggest 5 short, brandable, easy-to-remember YouTube channel name ideas as alternatives to "${channelTitle}", along with a matching @handle for each. Keep names under 20 characters, avoid random numbers, and make sure they hint at the channel's niche.`;
 
-// @route GET /api/analytics/audit
-// Channel health: engagement %, weekly Short-to-Long video ratio (Shorts =
-// duration <= 60s), and a few actionable, rule-based recommendations. Pulls
-// the connected channel's most recent uploads via the authorized YouTube
-// Data API (statistics + contentDetails are public fields, but calling as
-// the authenticated owner avoids a second API-key dependency for the
-// user's own channel).
-//
-// ⚠️ UPDATED (Boss request): now also pulls `snippet` + `brandingSettings`
-// so real channel-profile gaps (missing/short description, missing banner,
-// no custom handle/name set) can be detected — not just activity metrics.
-// `recommendations` is now an array of OBJECTS ({ type, message, prompt })
-// instead of plain strings, so the frontend can render an actionable
-// prompt-preview + Copy/Gemini buttons for the gaps that have one.
 router.get('/audit', protect, async (req, res) => {
   try {
     if (!req.user.youtubeChannel) {
@@ -280,8 +237,6 @@ router.get('/audit', protect, async (req, res) => {
         const videosRes = await youtube.videos.list({ part: 'statistics,contentDetails,snippet', id: videoIds.join(',') });
         const videos = videosRes.data.items || [];
 
-        // Engagement % = (likes + comments) / views, averaged across all
-        // fetched videos (VidIQ-style "engagement rate").
         const engagementRates = videos
           .map((v) => {
             const views = Number(v.statistics?.viewCount || 0);
@@ -295,7 +250,6 @@ router.get('/audit', protect, async (req, res) => {
           engagementPct = Math.round((engagementRates.reduce((s, r) => s + r, 0) / engagementRates.length) * 10000) / 100;
         }
 
-        // Weekly Short-to-Long ratio: Shorts = ISO-8601 duration <= 60s.
         const parseDurationSeconds = (iso) => {
           const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || '');
           if (!m) return 0;
@@ -312,65 +266,32 @@ router.get('/audit', protect, async (req, res) => {
     const channelTitle = channel.snippet?.title || 'your channel';
     const recommendations = [];
 
-    // ---- Activity/engagement gaps (unchanged logic, now object-shaped) ----
     if (engagementPct !== null && engagementPct < 2) {
-      recommendations.push({
-        type: 'engagement',
-        message: 'Engagement is under 2% — try asking a direct question in your first comment or video hook to prompt replies.',
-        prompt: null
-      });
+      recommendations.push({ type: 'engagement', message: 'Engagement is under 2% — try asking a direct question in your first comment or video hook to prompt replies.', prompt: null });
     }
     if (recentVideoCount === 0) {
-      recommendations.push({
-        type: 'uploads',
-        message: 'No uploads in the last 7 days — consistency is one of the biggest ranking signals on YouTube.',
-        prompt: null
-      });
+      recommendations.push({ type: 'uploads', message: 'No uploads in the last 7 days — consistency is one of the biggest ranking signals on YouTube.', prompt: null });
     }
     if (shortToLongRatio !== null && shortToLongRatio === 0 && recentVideoCount > 0) {
-      recommendations.push({
-        type: 'shorts',
-        message: 'You posted zero Shorts this week — Shorts are currently the fastest way to reach new subscribers.',
-        prompt: null
-      });
+      recommendations.push({ type: 'shorts', message: 'You posted zero Shorts this week — Shorts are currently the fastest way to reach new subscribers.', prompt: null });
     }
 
-    // ---- NEW: real channel-profile gaps (description / banner / name) ----
     const description = channel.snippet?.description || '';
     if (description.trim().length < 50) {
-      recommendations.push({
-        type: 'description',
-        message: 'Your channel description is missing or too short — a clear description helps YouTube understand your channel and improves search ranking.',
-        prompt: buildDescriptionPrompt(channelTitle)
-      });
+      recommendations.push({ type: 'description', message: 'Your channel description is missing or too short — a clear description helps YouTube understand your channel and improves search ranking.', prompt: buildDescriptionPrompt(channelTitle) });
     }
 
     const hasBanner = !!channel.brandingSettings?.image?.bannerExternalUrl;
     if (!hasBanner) {
-      recommendations.push({
-        type: 'banner',
-        message: 'Your channel has no banner image — a banner is the first visual impression for new visitors landing on your channel.',
-        prompt: buildBannerPrompt(channelTitle)
-      });
+      recommendations.push({ type: 'banner', message: 'Your channel has no banner image — a banner is the first visual impression for new visitors landing on your channel.', prompt: buildBannerPrompt(channelTitle) });
     }
 
-    // customUrl (the @handle) is only set once a channel has claimed a
-    // proper handle — its absence is a reliable, real signal that the
-    // channel name/branding hasn't been optimized yet.
     if (!channel.snippet?.customUrl) {
-      recommendations.push({
-        type: 'title',
-        message: 'Your channel doesn\'t have a custom handle set yet — a clear, brandable name and handle make you easier to find and remember.',
-        prompt: buildNamePrompt(channelTitle)
-      });
+      recommendations.push({ type: 'title', message: 'Your channel doesn\'t have a custom handle set yet — a clear, brandable name and handle make you easier to find and remember.', prompt: buildNamePrompt(channelTitle) });
     }
 
     if (recommendations.length === 0) {
-      recommendations.push({
-        type: 'healthy',
-        message: 'Your channel activity looks healthy — keep up the current posting cadence.',
-        prompt: null
-      });
+      recommendations.push({ type: 'healthy', message: 'Your channel activity looks healthy — keep up the current posting cadence.', prompt: null });
     }
 
     res.json({
