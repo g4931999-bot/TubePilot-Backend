@@ -1,7 +1,3 @@
-// Uses Groq's OpenAI-compatible chat completion endpoint, with OpenRouter
-// as a further fallback provider.
-// Docs: https://console.groq.com/docs/api-reference#chat-create
-//       https://openrouter.ai/docs
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
@@ -224,27 +220,62 @@ const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
   }
 };
 
-const analyzeSeoScore = async ({ title, description, tags = [], platform = 'youtube' }) => {
+// ⚠️ UPDATED (Boss request — plan/quota system): now accepts `mode`
+// ('basic' | 'advance'). This is a REAL prompt-depth difference, not just
+// a gate on top of the same output:
+//   'basic'   → lighter system prompt, asks ONLY for seoScore + breakdown
+//               (titleScore/descScore/tagScore). No recommendedTags, no
+//               notes, no competitor angle — cheaper AND intentionally
+//               less actionable, matching the ₹50 tier.
+//   'advance' → the full original analysis PLUS a new competitorGapNotes
+//               field: 1-2 sentences on what a top-ranking video in this
+//               niche likely does better, matching the ₹100/₹200 tiers.
+// Defaults to 'advance' when mode isn't passed, so any existing caller
+// that doesn't pass mode keeps today's full behavior unchanged.
+const analyzeSeoScore = async ({ title, description, tags = [], platform = 'youtube', mode = 'advance' }) => {
+  const basicSystemPrompt =
+    `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags at a high level. ` +
+    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}}. ' +
+    'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
+    'tagScore weighs relevance and coverage breadth. No markdown, no extra text.';
+
+  const advanceSystemPrompt =
+    `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags in depth. ` +
+    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "recommendedTags": [string], "notes": string, "competitorGapNotes": string}. ' +
+    'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
+    'tagScore weighs relevance and coverage breadth. recommendedTags is 5-10 additional tags the creator is missing. ' +
+    'competitorGapNotes is 1-2 sentences on what a top-ranking video in this niche likely does better than this one (packaging, pacing, hook strength, etc). No markdown, no extra text.';
+
   const raw = await callGroq(
-    `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags. ` +
-      'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "recommendedTags": [string], "notes": string}. ' +
-      'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
-      'tagScore weighs relevance and coverage breadth. recommendedTags is 5-10 additional tags the creator is missing. No markdown, no extra text.',
+    mode === 'basic' ? basicSystemPrompt : advanceSystemPrompt,
     `Title: ${title}\nDescription: ${description || '(none provided)'}\nExisting tags: ${(tags || []).join(', ') || '(none provided)'}`,
     { json: true }
   );
+
   try {
     const parsed = JSON.parse(raw);
-    return {
+    const result = {
       seoScore: Math.round(Number(parsed.seoScore) || 0),
       breakdown: {
         titleScore: Math.round(Number(parsed.breakdown?.titleScore) || 0),
         descScore: Math.round(Number(parsed.breakdown?.descScore) || 0),
         tagScore: Math.round(Number(parsed.breakdown?.tagScore) || 0)
-      },
-      recommendedTags: Array.isArray(parsed.recommendedTags) ? parsed.recommendedTags : [],
-      notes: parsed.notes || ''
+      }
     };
+
+    if (mode === 'basic') {
+      // Explicitly empty rather than omitted, so the frontend can always
+      // read the same shape and just show these as locked/blank for basic.
+      result.recommendedTags = [];
+      result.notes = '';
+      result.competitorGapNotes = '';
+    } else {
+      result.recommendedTags = Array.isArray(parsed.recommendedTags) ? parsed.recommendedTags : [];
+      result.notes = parsed.notes || '';
+      result.competitorGapNotes = parsed.competitorGapNotes || '';
+    }
+
+    return result;
   } catch {
     throw new Error('AI provider returned a non-JSON response for SEO scoring');
   }
