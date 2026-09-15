@@ -9,52 +9,69 @@ const GiftCode = require('../models/GiftCode');
 
 const router = express.Router();
 
-// ⚠️ BOSS UPDATE: pricing is no longer 1 Diamond = ₹1. Each package now has
-// its own diamonds amount + price — only these 4 sizes are sold.
-//   ₹10  → 99 diamonds
-//   ₹50  → 299 diamonds
-//   ₹100 → 599 diamonds
-//   ₹200 → 799 diamonds
-const DIAMOND_PACKAGES = [
-  { diamonds: 99, priceINR: 10 },
-  { diamonds: 299, priceINR: 50 },
-  { diamonds: 599, priceINR: 100 },
-  { diamonds: 799, priceINR: 200 },
+// ⚠️ BOSS UPDATE (plan/quota system): every package carries its own
+// tier-level ENTITLEMENTS. This is the real fix for "same features shown
+// at every price" — enforced server-side (ai.js / analytics.js) AND now
+// also reflected honestly in the Diamond Store UI via `features` below.
+//   tier 1 (₹10)  → 1 thumbnail prompt,  SEO: none,      Competitor: none
+//   tier 2 (₹50)  → 5 thumbnail prompts, SEO: basic,     Competitor: none
+//   tier 3 (₹100) → 10 thumbnail prompts,SEO: advance,   Competitor: basic
+//   tier 4 (₹200) → 20 thumbnail prompts,SEO: advance,   Competitor: advance
+const DIAMOND_PACKAGES_BASE = [
+  { tier: 1, diamonds: 99,  priceINR: 10,  thumbnailPrompts: 1,  seoScoreLevel: 'none',    competitorLevel: 'none' },
+  { tier: 2, diamonds: 299, priceINR: 50,  thumbnailPrompts: 5,  seoScoreLevel: 'basic',   competitorLevel: 'none' },
+  { tier: 3, diamonds: 599, priceINR: 100, thumbnailPrompts: 10, seoScoreLevel: 'advance', competitorLevel: 'basic' },
+  { tier: 4, diamonds: 799, priceINR: 200, thumbnailPrompts: 20, seoScoreLevel: 'advance', competitorLevel: 'advance' },
 ];
+
+// ⚠️ NEW: builds the honest "What's included" list the Flutter screen
+// renders directly (no more static facilityKeys on the frontend). Every
+// package gets the SAME 5 rows in the SAME order, each with `included`
+// true/false — so a lower tier visibly shows what it's missing (grey
+// cross) instead of silently listing features it doesn't actually grant.
+const buildFeatureList = (pkg) => [
+  { label: 'AI Title Generation', included: true },
+  { label: 'AI Description Generation', included: true },
+  {
+    label: pkg.thumbnailPrompts === 1 ? '1 Thumbnail Prompt' : `${pkg.thumbnailPrompts} Thumbnail Prompts`,
+    included: pkg.thumbnailPrompts > 0
+  },
+  {
+    label: pkg.seoScoreLevel === 'none' ? 'SEO Score Analysis' : `SEO Score Analysis (${pkg.seoScoreLevel === 'basic' ? 'Basic' : 'Advance'})`,
+    included: pkg.seoScoreLevel !== 'none'
+  },
+  {
+    label: pkg.competitorLevel === 'none' ? 'Competitor Analysing System' : `Competitor Analysing System (${pkg.competitorLevel === 'basic' ? 'Basic' : 'Advance'})`,
+    included: pkg.competitorLevel !== 'none'
+  }
+];
+
+const DIAMOND_PACKAGES = DIAMOND_PACKAGES_BASE.map((pkg) => ({ ...pkg, features: buildFeatureList(pkg) }));
 
 // @route GET /api/diamonds/packages
 router.get('/packages', protect, (req, res) => {
-  // The app reads this to decide CFEnvironment.SANDBOX vs .PRODUCTION at
-  // runtime — so switching environments is purely a backend .env change
-  // (CASHFREE_ENV=SANDBOX/PRODUCTION + matching keys) + server restart.
-  // No Flutter rebuild ever needed for this.
   res.json({ success: true, packages: DIAMOND_PACKAGES, currentBalance: req.user.diamondBalance, cashfreeEnvironment: CASHFREE_ENV });
 });
 
-/**
- * Shared "claim + credit" logic. Used by handleVerifyPayment (app poll),
- * the webhook, and the background auto-check job below — three different
- * triggers can all race to be the one that confirms a given order, so this
- * is the ONLY place that ever flips a transaction to 'approved' and
- * increments diamondBalance.
- *
- * The findOneAndUpdate's `{ status: 'pending' }` filter is the atomic
- * claim: whichever caller's update lands first wins and gets a non-null
- * result back; every other (near-)simultaneous caller gets null and just
- * no-ops. This is what makes it safe for three independent triggers to
- * all be checking the same order at once without ever double-crediting.
- */
 const creditApprovedTransaction = async (transactionId, source) => {
   const claimed = await Transaction.findOneAndUpdate(
     { _id: transactionId, status: 'pending' },
     { $set: { status: 'approved', reviewedAt: new Date(), adminNote: `Auto-approved via ${source}` } },
     { new: true }
   );
-  if (!claimed) return null; // someone else already claimed/credited this order
+  if (!claimed) return null;
 
   const updatedUser = await User.findByIdAndUpdate(
     claimed.user,
-    { $inc: { diamondBalance: claimed.diamondPackage } },
+    {
+      $inc: { diamondBalance: claimed.diamondPackage },
+      $set: {
+        activeTier: claimed.planTier,
+        thumbnailPromptsRemaining: claimed.thumbnailPrompts,
+        seoScoreLevel: claimed.seoScoreLevel,
+        competitorLevel: claimed.competitorLevel
+      }
+    },
     { new: true }
   );
 
@@ -63,7 +80,7 @@ const creditApprovedTransaction = async (transactionId, source) => {
       user: updatedUser._id,
       type: 'payment_approved',
       title: 'Payment Successful 🎉',
-      message: `₹${claimed.amountINR} paid — ${claimed.diamondPackage} diamonds added to your wallet.`
+      message: `₹${claimed.amountINR} paid — ${claimed.diamondPackage} diamonds added, plan upgraded.`
     });
 
     await sendPushToUser(updatedUser, {
@@ -76,15 +93,8 @@ const creditApprovedTransaction = async (transactionId, source) => {
   return { claimed, updatedUser };
 };
 
-/**
- * Controller: Create Order
- */
 const handleCreateOrder = async (req, res) => {
   try {
-    // Accepts 'diamondPackage', 'packageId', or 'amount' to ensure full frontend compatibility.
-    // ⚠️ BOSS UPDATE: the app sends the DIAMONDS amount (e.g. 99/299/599/799)
-    // here, not a price — since price no longer equals diamonds 1:1, we
-    // look up the matching package to find what to actually charge.
     const rawPackage = req.body.diamondPackage || req.body.packageId || req.body.amount;
     const requestedDiamonds = Number(rawPackage);
 
@@ -92,13 +102,12 @@ const handleCreateOrder = async (req, res) => {
 
     if (!pkg) {
       const validOptions = DIAMOND_PACKAGES.map((p) => p.diamonds).join(', ');
-      return res.status(400).json({ 
-        success: false, 
-        message: `Invalid diamond package selection. Choose ${validOptions} diamonds.` 
+      return res.status(400).json({
+        success: false,
+        message: `Invalid diamond package selection. Choose ${validOptions} diamonds.`
       });
     }
 
-    // Cashfree requires a unique order_id per attempt
     const userIdentifier = req.user.userId || req.user._id.toString().slice(-6);
     const orderId = `TP${userIdentifier}_${Date.now()}`;
 
@@ -106,8 +115,12 @@ const handleCreateOrder = async (req, res) => {
       user: req.user._id,
       userDisplayId: userIdentifier,
       type: 'diamond_purchase',
-      diamondPackage: pkg.diamonds, // diamonds credited on approval
-      amountINR: pkg.priceINR,      // actual rupees charged (no longer 1:1 with diamonds)
+      diamondPackage: pkg.diamonds,
+      amountINR: pkg.priceINR,
+      planTier: pkg.tier,
+      thumbnailPrompts: pkg.thumbnailPrompts,
+      seoScoreLevel: pkg.seoScoreLevel,
+      competitorLevel: pkg.competitorLevel,
       status: 'pending',
       paymentMethod: 'cashfree',
       cashfreeOrderId: orderId
@@ -125,7 +138,7 @@ const handleCreateOrder = async (req, res) => {
     transaction.paymentSessionId = order.paymentSessionId;
     await transaction.save();
 
-    console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${orderId}, amount=₹${pkg.priceINR}, diamonds=${pkg.diamonds}`);
+    console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${orderId}, amount=₹${pkg.priceINR}, diamonds=${pkg.diamonds}, tier=${pkg.tier}`);
 
     res.status(201).json({
       success: true,
@@ -142,9 +155,6 @@ const handleCreateOrder = async (req, res) => {
   }
 };
 
-/**
- * Controller: Verify Payment
- */
 const handleVerifyPayment = async (req, res) => {
   try {
     const { orderId } = req.body;
@@ -174,12 +184,12 @@ const handleVerifyPayment = async (req, res) => {
       }
 
       console.log(`✅ [Cashfree] Order ${orderId}: PAID — credited ${result.claimed.diamondPackage} diamonds to user ${req.user._id}`);
-      return res.json({ 
-        success: true, 
-        status: 'approved', 
-        message: 'Payment confirmed, diamonds credited', 
+      return res.json({
+        success: true,
+        status: 'approved',
+        message: 'Payment confirmed, diamonds credited',
         transaction: result.claimed,
-        diamondBalance: result.updatedUser?.diamondBalance 
+        diamondBalance: result.updatedUser?.diamondBalance
       });
     }
 
@@ -197,21 +207,13 @@ const handleVerifyPayment = async (req, res) => {
   }
 };
 
-// -----------------------------------------------------------------------
-// Route Registrations (Supports main paths + all legacy aliases)
-// -----------------------------------------------------------------------
-
-// Create Order Routes
 router.post('/create-order', protect, handleCreateOrder);
 router.post('/buy-diamonds', protect, handleCreateOrder);
 router.post('/buy', protect, handleCreateOrder);
 
-// Verify Payment Routes
 router.post('/verify-payment', protect, handleVerifyPayment);
 router.post('/verify', protect, handleVerifyPayment);
 
-// @route GET /api/payment/verify?order_id=...  (Cashfree's return_url —
-// see utils/cashfree.js order_meta.return_url)
 router.get('/verify', (req, res) => {
   res.status(200).send(`<!DOCTYPE html>
 <html>
@@ -226,7 +228,6 @@ router.get('/verify', (req, res) => {
 </html>`);
 });
 
-// @route POST /api/diamonds/webhook  (Cashfree server-to-server webhook)
 router.post('/webhook', async (req, res) => {
   try {
     const orderId = req.body?.data?.order?.order_id;
@@ -256,7 +257,6 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
-// @route POST /api/diamonds/redeem-gift-code  { code }
 router.post('/redeem-gift-code', protect, async (req, res) => {
   try {
     const code = (req.body.code || '').trim().toUpperCase();
@@ -303,35 +303,21 @@ router.post('/redeem-gift-code', protect, async (req, res) => {
   }
 });
 
-// @route GET /api/diamonds/my-requests
 router.get('/my-requests', protect, async (req, res) => {
   const transactions = await Transaction.find({ user: req.user._id, type: 'diamond_purchase' }).sort({ createdAt: -1 });
   res.json({ success: true, transactions });
 });
 
-// -----------------------------------------------------------------------
-// Background Auto-Check Job
-// -----------------------------------------------------------------------
-// WHY THIS EXISTS: a pending order only gets credited today via (a) the
-// app's own 18s poll loop right after checkout closes, or (b) Cashfree's
-// webhook. If the user backgrounds/kills the app mid-poll, or the webhook
-// URL isn't configured in the Cashfree dashboard, NEITHER fires — and the
-// order sits as 'pending' forever, which is exactly why the admin panel
-// had a stack of "Pending" orders needing a manual Approve click.
-//
-// This job is the safety net for both: every 60s it re-checks every
-// pending Cashfree order directly against Cashfree's server and credits
-// diamonds the moment it sees PAID — no admin action required, ever.
-const AUTO_CHECK_INTERVAL_MS = 60 * 1000;      // run every 1 minute
-const AUTO_CHECK_MAX_AGE_HOURS = 24;           // ignore/auto-expire anything older than this
-const AUTO_CHECK_BATCH_SIZE = 10;              // check this many orders concurrently per batch
-const AUTO_CHECK_BATCH_DELAY_MS = 400;         // gap between batches, so we don't hammer Cashfree's API
-const AUTO_CHECK_MAX_PER_RUN = 200;            // hard cap per run, keeps the job cheap even if pending pile up
+const AUTO_CHECK_INTERVAL_MS = 60 * 1000;
+const AUTO_CHECK_MAX_AGE_HOURS = 24;
+const AUTO_CHECK_BATCH_SIZE = 10;
+const AUTO_CHECK_BATCH_DELAY_MS = 400;
+const AUTO_CHECK_MAX_PER_RUN = 200;
 
-let autoCheckRunning = false; // re-entrancy guard: skip a tick if the previous one is still going
+let autoCheckRunning = false;
 
 async function autoCheckPendingOrders() {
-  if (autoCheckRunning) return; // previous run overran the 1-minute interval — skip this tick
+  if (autoCheckRunning) return;
   autoCheckRunning = true;
 
   try {
@@ -365,10 +351,7 @@ async function autoCheckPendingOrders() {
                 { $set: { status: 'rejected', adminNote: `Cashfree order status: ${cfOrder.order_status} (auto-check job)` } }
               );
             }
-            // else still pending on Cashfree's side — leave it, next tick will retry
           } catch (err) {
-            // One bad order (Cashfree API hiccup, network blip) must never
-            // stop the rest of the batch or kill the interval.
             console.error(`❌ [Cashfree AutoCheck] order ${transaction.cashfreeOrderId} check failed:`, err.response?.data || err.message);
           }
         }));
@@ -379,8 +362,6 @@ async function autoCheckPendingOrders() {
       }
     }
 
-    // Anything past the cutoff is a genuinely abandoned checkout (user
-    // never paid) — auto-expire it so "Pending" doesn't grow forever.
     await Transaction.updateMany(
       { type: 'diamond_purchase', status: 'pending', paymentMethod: 'cashfree', createdAt: { $lt: cutoff } },
       { $set: { status: 'rejected', adminNote: `Auto-expired — no payment confirmation within ${AUTO_CHECK_MAX_AGE_HOURS}h` } }
