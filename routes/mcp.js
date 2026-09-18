@@ -22,6 +22,22 @@ const router = express.Router();
 const AI_FEATURE_COST = { title: 2, description: 2, hashtags: 2 };
 const DIAMOND_COST_PER_UPLOAD = Number(process.env.DIAMOND_COST_PER_UPLOAD || 10);
 
+// ⚠️ NEW: tiny logger so every log line from this file is easy to grep in
+// Render ("grep MCP" will find everything below). Logs go to stdout/stderr
+// via console.*, which Render already captures — nothing extra to set up.
+const log = (...args) => console.log('[MCP]', new Date().toISOString(), ...args);
+const logError = (label, err, extra = {}) => {
+  console.error(
+    '[MCP][ERROR]',
+    new Date().toISOString(),
+    label,
+    '\nmessage:', err && err.message,
+    '\ncode:', err && err.code,
+    '\nextra:', JSON.stringify(extra),
+    '\nstack:', err && err.stack
+  );
+};
+
 const chargeDiamonds = async (user, cost) => {
   if (user.diamondBalance < cost) {
     const err = new Error(`Not enough diamonds for this action. Buy more at ${process.env.PUBLIC_APP_STORE_URL || 'the TubePilot Diamond Store'} (starting at ₹10).`);
@@ -46,6 +62,7 @@ const mcpAuth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
     if (!token) {
+      log('mcpAuth: no bearer token on', req.method, req.originalUrl);
       const base = process.env.PUBLIC_BACKEND_URL || `${req.protocol}://${req.get('host')}`;
       res.set('WWW-Authenticate', `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`);
       return res.status(401).json({ error: 'unauthorized', error_description: 'No access token provided' });
@@ -53,36 +70,22 @@ const mcpAuth = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id);
     if (!user || !user.isActive) {
+      log('mcpAuth: user not found or inactive for decoded id', decoded.id);
       return res.status(401).json({ error: 'unauthorized', error_description: 'User not found or inactive' });
     }
     req.user = user;
     next();
   } catch (err) {
+    // ⚠️ NEW: this used to fail silently (just a 401 with no server-side
+    // trace). Any jwt.verify failure, DB timeout, etc. now gets logged
+    // with a full stack trace so it's visible in Render.
+    logError('mcpAuth threw', err, { hasAuthHeader: !!req.headers.authorization });
     return res.status(401).json({ error: 'unauthorized', error_description: 'Invalid or expired access token' });
   }
 };
 
 // -----------------------------------------------------------------------
 // Tool definitions — what Claude/ChatGPT see when they call "tools/list".
-// Descriptions matter a lot here: this is what the AI reads to decide
-// when to use each tool, so they're written plainly for that purpose.
-//
-// ⚠️ NEW: `annotations` added on every tool. Anthropic's Connector
-// Directory review explicitly checks that readOnlyHint/destructiveHint
-// match real behavior — without these, submission is rejected outright.
-//   - readOnlyHint: true only for check_balance (nothing else is a pure
-//     read; the four AI/upload tools all mutate diamondBalance or create
-//     a Video document).
-//   - destructiveHint: false everywhere — nothing here deletes or
-//     overwrites existing user data; schedule_video only CREATES a new
-//     video/publish job.
-//   - idempotentHint: true only for check_balance — calling any of the
-//     others twice charges diamonds / schedules twice, so they are NOT
-//     idempotent.
-//   - openWorldHint: true for the three generation tools (they call out
-//     to the Groq LLM) and schedule_video (it ultimately publishes to
-//     YouTube, a real external system); false for check_balance (purely
-//     internal DB read).
 // -----------------------------------------------------------------------
 const TOOLS = [
   {
@@ -201,13 +204,6 @@ const runGenerateHashtags = async (user, args) => {
   return toolTextResult(`Hashtags: ${hashtags.map((h) => `#${h}`).join(' ')}\n\n(${AI_FEATURE_COST.hashtags} diamonds used — ${user.diamondBalance} remaining)`);
 };
 
-// Boss's rules, enforced exactly as in the app:
-//   - free upload credits used first (chargeForUpload, from routes/video.js)
-//   - once free credits AND diamonds are both exhausted, scheduling is
-//     blocked with an upgrade message until the user buys a package
-//   - video is tagged sourceProvider: 'mcp' so cron/scheduler.js knows to
-//     delete the Video document entirely (not just the stored file) once
-//     it finishes publishing — see scheduler.js patch
 const runScheduleVideo = async (user, args) => {
   if (!user.youtubeChannel) {
     return toolErrorResult('This TubePilot account has no YouTube channel connected yet. Connect one in the TubePilot app first, then try again.');
@@ -246,15 +242,8 @@ const runScheduleVideo = async (user, args) => {
 
   let stored;
   if (args.videoUrl) {
-    // Link case: don't re-download/re-host it ourselves — the publish
-    // scheduler's getVideoFileStream() already falls back to a plain
-    // axios stream for any storageProvider it doesn't specifically
-    // recognize (only 'google_drive' gets special handling), so pointing
-    // storageUrl straight at the given link works with zero extra code.
     stored = { storageProvider: 'mcp_external_url', storageFileId: '', storageUrl: args.videoUrl };
   } else {
-    // Attached-file case (mainly Claude, which supports file resources in
-    // MCP tool calls): decode and store exactly like a normal app upload.
     const buffer = Buffer.from(args.videoBase64, 'base64');
     stored = await storeVideoFile(buffer, `${user.userId}_mcp_${Date.now()}`, 'video/mp4');
   }
@@ -265,7 +254,7 @@ const runScheduleVideo = async (user, args) => {
     storageFileId: stored.storageFileId,
     storageUrl: stored.storageUrl,
     videoUrl: stored.storageUrl,
-    sourceProvider: 'mcp', // ⚠️ tells cron/scheduler.js to fully delete this Video doc after successful publish
+    sourceProvider: 'mcp',
     platforms: [{
       platform: 'youtube',
       postType: 'video',
@@ -318,9 +307,21 @@ const TOOL_HANDLERS = {
 // connector only needs tools.)
 // -----------------------------------------------------------------------
 router.post('/', mcpAuth, express.json(), async (req, res) => {
+  // ⚠️ NEW: log every incoming MCP call before doing anything else. This
+  // alone will show in Render logs whether the request even reached us
+  // with a parsed body, which method/tool it was, and which user.
+  log('incoming', {
+    method: req.body && req.body.method,
+    toolName: req.body && req.body.params && req.body.params.name,
+    userId: req.user && req.user._id,
+    contentType: req.headers['content-type'],
+    bodyIsEmpty: !req.body || Object.keys(req.body).length === 0
+  });
+
   const { jsonrpc, id, method, params } = req.body || {};
 
   if (jsonrpc !== '2.0' || !method) {
+    log('rejected: bad JSON-RPC envelope', { jsonrpc, method, rawBody: req.body });
     return res.status(400).json(jsonRpcError(id ?? null, -32600, 'Invalid JSON-RPC request'));
   }
 
@@ -342,23 +343,32 @@ router.post('/', mcpAuth, express.json(), async (req, res) => {
       const args = params?.arguments || {};
       const handler = TOOL_HANDLERS[toolName];
       if (!handler) {
+        log('unknown tool requested', toolName);
         return res.status(404).json(jsonRpcError(id, -32601, `Unknown tool: ${toolName}`));
       }
 
       try {
         const result = await handler(req.user, args);
+        log('tool call ok', { toolName, userId: req.user._id, isError: !!result.isError });
         return res.json(jsonRpcResult(id, result));
       } catch (err) {
-        // Diamond-related errors are shown to the AI as a normal tool
-        // result (isError: true) rather than a transport-level failure —
-        // so it can relay "you're out of credits, upgrade here" back to
-        // the user in conversation instead of just erroring out silently.
+        // ⚠️ NEW: this is almost certainly where your check_balance
+        // failure is coming from — any exception thrown inside a tool
+        // handler (DB error, undefined field access, etc.) lands here.
+        // Previously it was swallowed into a plain toolErrorResult with
+        // no server-side trace. Now it's fully logged first.
+        logError(`tool "${toolName}" handler threw`, err, { userId: req.user && req.user._id, args });
         return res.json(jsonRpcResult(id, toolErrorResult(err.message)));
       }
     }
 
+    log('unknown method', method);
     return res.status(404).json(jsonRpcError(id, -32601, `Unknown method: ${method}`));
   } catch (err) {
+    // ⚠️ NEW: top-level catch-all — if this fires, the bug is in envelope
+    // handling itself (not inside a specific tool), so it's logged
+    // separately to make that distinction obvious in Render.
+    logError('top-level /mcp handler threw', err, { method, toolName: params?.name });
     return res.status(500).json(jsonRpcError(id ?? null, -32000, err.message));
   }
 });
