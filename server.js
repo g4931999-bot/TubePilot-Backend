@@ -82,7 +82,8 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256', 'plain'],
-    token_endpoint_auth_methods_supported: ['none', 'client_secret_post']
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
+    scopes_supported: ['tubepilot'] // ⚠️ NEW — matches the "scope" value /oauth/token already returns
   });
 });
 
@@ -110,6 +111,11 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
+// ⚠️ NEW — /oauth/authorize (POST) is where email/password is verified for
+// the MCP connector login screen, exactly like /api/auth/login. Without
+// this it sat completely outside globalLimiter's '/api/' scope too, so it
+// had ZERO brute-force protection while the normal login did.
+app.use('/oauth/authorize', authLimiter);
 
 // --- API Route Mappings ---
 app.use('/api/auth', authRoutes);
