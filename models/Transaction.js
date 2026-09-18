@@ -9,13 +9,13 @@ const TransactionSchema = new mongoose.Schema({
   diamondPackage: { type: Number, enum: [99, 299, 599, 799], required: function () { return this.type === 'diamond_purchase'; } },
   amountINR: { type: Number, required: function () { return this.type === 'diamond_purchase'; } },
 
-  // ⚠️ NEW (Boss request — plan/quota system): snapshot of the tier's
-  // entitlements AT PURCHASE TIME, saved on the transaction itself. Why:
-  // creditApprovedTransaction() can be called by 3 different triggers
-  // (app poll / webhook / auto-check job — see routes/diamond.js), and
-  // whichever one fires needs to know what tier this specific order was
-  // for WITHOUT re-deriving it from priceINR. Kept even if DIAMOND_PACKAGES
-  // config changes later — this transaction stays historically accurate.
+  // Snapshot of the tier's entitlements AT PURCHASE TIME, saved on the
+  // transaction itself. creditApprovedTransaction() can be called by 3
+  // different triggers (app poll / webhook / auto-check job — see
+  // routes/diamond.js), and whichever one fires needs to know what tier
+  // this specific order was for WITHOUT re-deriving it from priceINR.
+  // Kept even if DIAMOND_PACKAGES config changes later — this transaction
+  // stays historically accurate.
   planTier: { type: Number, default: null },
   thumbnailPrompts: { type: Number, default: 0 },
   seoScoreLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
