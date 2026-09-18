@@ -29,6 +29,8 @@ const deleteStoredVideoFile = async (video) => {
     if (video.storageProvider === 'cloudinary_1') await deleteFromCloudinary(account1, video.storageFileId);
     else if (video.storageProvider === 'cloudinary_2') await deleteFromCloudinary(account2, video.storageFileId);
     else if (video.storageProvider === 'google_drive') await deleteDriveFile(video.storageFileId);
+    // Nothing to actually delete for 'mcp_external_url' (a link the user
+    // gave us, never our own copy) — just clear our reference to it below.
     video.storageUrl = '';
     video.storageDeleteAt = null;
   } catch (err) {
@@ -207,6 +209,30 @@ const refundFailedVideoIfNeeded = async (video, user) => {
   }).catch(() => {});
 };
 
+// -----------------------------------------------------------------------
+// ⚠️ NEW (Boss request — MCP integration): a video created via an AI
+// connector (Claude/ChatGPT) is tagged `sourceProvider: 'mcp'` at creation
+// (see routes/mcp.js's schedule_video tool). Unlike normal app uploads —
+// which just clear the STORED FILE once nothing is pending, but keep the
+// Video document around in "My Videos" — an MCP video is meant to leave no
+// trace once it's actually live: the whole database record is deleted too.
+//
+// Only runs on a FULLY successful publish (every platform target reached
+// 'uploaded'). If it failed instead, the record is deliberately kept —
+// refundFailedVideoIfNeeded() above already ran and refunded the user, and
+// keeping the record lets them see what happened (e.g. in admin tooling)
+// rather than silently vanishing on failure.
+// -----------------------------------------------------------------------
+const cleanupMcpVideoIfDone = async (video) => {
+  if (video.sourceProvider !== 'mcp') return false;
+  const allSucceeded = video.platforms.length > 0 && video.platforms.every((t) => t.status === 'uploaded');
+  if (!allSucceeded) return false;
+
+  console.log(`🧹 [Scheduler] Video ${video._id}: MCP-sourced video fully published — removing from TubePilot's database (storage file already cleared).`);
+  await video.deleteOne();
+  return true;
+};
+
 const processVideoTargets = async (video) => {
   const user = await User.findById(video.user);
   if (!user) {
@@ -308,6 +334,14 @@ const processVideoTargets = async (video) => {
     await deleteStoredVideoFile(video);
     await video.save();
   }
+
+  // ⚠️ NEW: only after the file/storage cleanup above, and only once
+  // nothing is still pending, check whether this whole Video document
+  // should disappear (MCP-sourced + fully successful). Placed last so it
+  // never races the refund/notification logic above.
+  if (!stillNeedsFile) {
+    await cleanupMcpVideoIfDone(video);
+  }
 };
 
 // -----------------------------------------------------------------------
@@ -360,6 +394,12 @@ const promoteScheduledYouTubeVideos = async () => {
         body: 'It just switched from unlisted to public as scheduled.',
         data: { type: 'youtube_promoted', videoId: video._id.toString(), platformUrl: target.platformUrl }
       });
+
+      // ⚠️ NEW: an MCP video that was uploaded unlisted-early and just got
+      // promoted to public here (rather than in processVideoTargets above)
+      // also needs the same cleanup check — this is the other place a
+      // target can reach its final 'uploaded'-and-public state.
+      await cleanupMcpVideoIfDone(video);
     } catch (err) {
       console.error(`❌ [Scheduler] Video ${video._id} / youtube: privacy promotion failed — ${err.message}`);
     }
