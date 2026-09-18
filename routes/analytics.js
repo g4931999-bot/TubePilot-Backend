@@ -55,6 +55,11 @@ router.get('/', protect, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Competitor Tracking
+// ---------------------------------------------------------------------------
+
+// @route GET /api/analytics/competitors/search?q=tube
 router.get('/competitors/search', protect, async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
@@ -87,6 +92,7 @@ router.get('/competitors/search', protect, async (req, res) => {
   }
 });
 
+// @route GET /api/analytics/competitors
 router.get('/competitors', protect, async (req, res) => {
   try {
     const competitors = await Competitor.find({ user: req.user._id }).sort({ createdAt: -1 });
@@ -106,8 +112,8 @@ router.get('/competitors', protect, async (req, res) => {
       })
     );
 
-    // ⚠️ NEW: basic-tier users only see subscriberCount/viewCount/videoCount
-    // — the deeper VPH/trend signal is stripped from the response for them
+    // basic-tier users only see subscriberCount/viewCount/videoCount — the
+    // deeper VPH/trend signal is stripped from the response for them
     // (still gated even if a stale cache had it from a previous higher plan).
     const responseCompetitors = req.user.competitorLevel === 'basic'
       ? competitors.map((c) => {
@@ -124,9 +130,6 @@ router.get('/competitors', protect, async (req, res) => {
 });
 
 // @route POST /api/analytics/competitors  { channelId?, handle?, label? }
-// ⚠️ UPDATED (Boss request — plan/quota system): gated behind
-// req.user.competitorLevel — tier 1 buyers ('none') cannot add any
-// competitor at all now.
 router.post('/competitors', protect, async (req, res) => {
   try {
     if (req.user.competitorLevel === 'none') {
@@ -168,6 +171,7 @@ router.post('/competitors', protect, async (req, res) => {
   }
 });
 
+// @route DELETE /api/analytics/competitors/:id
 router.delete('/competitors/:id', protect, async (req, res) => {
   try {
     const competitor = await Competitor.findOneAndDelete({ _id: req.params.id, user: req.user._id });
@@ -177,6 +181,10 @@ router.delete('/competitors/:id', protect, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Channel Audit / Channel SEO Score
+// ---------------------------------------------------------------------------
 
 const ensureFreshTokenForAudit = async (user) => {
   const channel = user.youtubeChannel;
@@ -207,6 +215,15 @@ const buildBannerPrompt = (channelTitle) =>
 const buildNamePrompt = (channelTitle) =>
   `Suggest 5 short, brandable, easy-to-remember YouTube channel name ideas as alternatives to "${channelTitle}", along with a matching @handle for each. Keep names under 20 characters, avoid random numbers, and make sure they hint at the channel's niche.`;
 
+// @route GET /api/analytics/audit
+// Channel SEO Score (renamed from "Channel Audit"). Score/stats are ALWAYS
+// computed and returned regardless of plan. `recommendations` (the
+// suggestion list) is gated behind req.user.seoScoreLevel === 'advance'
+// (₹100+ packs) — a STRICTER threshold than Video SEO Optimizer's gate in
+// routes/ai.js (which unlocks from ANY paid pack). Below that threshold,
+// `recommendations` is returned as an empty array + `channelSeoUnlocked:
+// false` — no blurred preview, no partial suggestion, the frontend shows a
+// single upgrade banner instead.
 router.get('/audit', protect, async (req, res) => {
   try {
     if (!req.user.youtubeChannel) {
@@ -294,6 +311,13 @@ router.get('/audit', protect, async (req, res) => {
       recommendations.push({ type: 'healthy', message: 'Your channel activity looks healthy — keep up the current posting cadence.', prompt: null });
     }
 
+    // Gate applied HERE, after computing everything — score/stats above
+    // are always full; only `recommendations` is stripped for non-'advance'
+    // users. Channel SEO Score requires 'advance' specifically (₹100+),
+    // NOT just any non-'none' value — this is what makes it stricter than
+    // Video SEO Optimizer's gate in routes/ai.js.
+    const channelSeoUnlocked = req.user.seoScoreLevel === 'advance';
+
     res.json({
       success: true,
       audit: {
@@ -303,7 +327,8 @@ router.get('/audit', protect, async (req, res) => {
         engagementPct,
         weeklyShortToLongRatio: shortToLongRatio,
         recentUploadsLast7Days: recentVideoCount,
-        recommendations
+        channelSeoUnlocked,
+        recommendations: channelSeoUnlocked ? recommendations : []
       }
     });
   } catch (err) {
