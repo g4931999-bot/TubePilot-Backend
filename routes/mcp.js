@@ -66,6 +66,23 @@ const mcpAuth = async (req, res, next) => {
 // Tool definitions — what Claude/ChatGPT see when they call "tools/list".
 // Descriptions matter a lot here: this is what the AI reads to decide
 // when to use each tool, so they're written plainly for that purpose.
+//
+// ⚠️ NEW: `annotations` added on every tool. Anthropic's Connector
+// Directory review explicitly checks that readOnlyHint/destructiveHint
+// match real behavior — without these, submission is rejected outright.
+//   - readOnlyHint: true only for check_balance (nothing else is a pure
+//     read; the four AI/upload tools all mutate diamondBalance or create
+//     a Video document).
+//   - destructiveHint: false everywhere — nothing here deletes or
+//     overwrites existing user data; schedule_video only CREATES a new
+//     video/publish job.
+//   - idempotentHint: true only for check_balance — calling any of the
+//     others twice charges diamonds / schedules twice, so they are NOT
+//     idempotent.
+//   - openWorldHint: true for the three generation tools (they call out
+//     to the Groq LLM) and schedule_video (it ultimately publishes to
+//     YouTube, a real external system); false for check_balance (purely
+//     internal DB read).
 // -----------------------------------------------------------------------
 const TOOLS = [
   {
@@ -75,6 +92,13 @@ const TOOLS = [
       type: 'object',
       properties: { topic: { type: 'string', description: 'What the video is about' } },
       required: ['topic']
+    },
+    annotations: {
+      title: 'Generate Video Title',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
     }
   },
   {
@@ -84,6 +108,13 @@ const TOOLS = [
       type: 'object',
       properties: { topic: { type: 'string', description: 'What the video is about' } },
       required: ['topic']
+    },
+    annotations: {
+      title: 'Generate Video Description',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
     }
   },
   {
@@ -93,6 +124,13 @@ const TOOLS = [
       type: 'object',
       properties: { topic: { type: 'string', description: 'What the video is about' } },
       required: ['topic']
+    },
+    annotations: {
+      title: 'Generate Video Hashtags',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
     }
   },
   {
@@ -110,12 +148,26 @@ const TOOLS = [
         scheduledAt: { type: 'string', description: 'ISO 8601 datetime to publish at. Omit to publish as soon as processed.' }
       },
       required: ['title']
+    },
+    annotations: {
+      title: 'Schedule YouTube Upload',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
     }
   },
   {
     name: 'check_balance',
     description: 'Check the user\'s remaining free upload credits and diamond balance on TubePilot.',
-    inputSchema: { type: 'object', properties: {} }
+    inputSchema: { type: 'object', properties: {} },
+    annotations: {
+      title: 'Check TubePilot Balance',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
   }
 ];
 
