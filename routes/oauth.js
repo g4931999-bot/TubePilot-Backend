@@ -1,11 +1,16 @@
 const express = require('express');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const OAuthClient = require('../models/OAuthClient');
 const OAuthCode = require('../models/OAuthCode');
+const { generateUserId, generateReferralCode } = require('../utils/idGenerator');
 
 const router = express.Router();
+// Same Google client TubePilot's normal app login already uses (routes/auth.js) —
+// same GOOGLE_CLIENT_ID env var, so Google tokens work identically here.
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // -----------------------------------------------------------------------
 // This is the "login screen that opens in a browser when the user connects
@@ -14,10 +19,15 @@ const router = express.Router();
 // can't safely hold a client secret).
 //
 // Flow:
-//   1. GET  /oauth/authorize   — shows a web login+consent page
+//   1. GET  /oauth/authorize   — shows a web login+consent page (email/
+//                                 password OR Google Sign-In)
 //   2. POST /oauth/authorize   — verifies email/password, issues a short-
 //                                 lived authorization code, redirects back
 //                                 to Claude/ChatGPT's redirect_uri
+//   2b. POST /oauth/google     — same thing, but for the Google button:
+//                                 verifies the Google idToken, finds/creates
+//                                 the user exactly like /api/auth/google
+//                                 does, then issues the same kind of code
 //   3. POST /oauth/token       — exchanges that code (+ PKCE verifier) for
 //                                 a real access token
 //
@@ -27,18 +37,16 @@ const router = express.Router();
 // can reuse `protect` directly for every tool call.
 //
 // ⚠️ NOTE: /.well-known/oauth-authorization-server and
-// /.well-known/oauth-protected-resource have been MOVED to app.js and
-// mounted directly on the Express `app` (not this router). They must live
-// at the root path — Claude/ChatGPT probe /.well-known/..., not
-// /oauth/.well-known/... — and this router is mounted at /oauth, so
-// keeping them here would put them at the wrong URL and break connector
-// discovery entirely.
+// /.well-known/oauth-protected-resource live in app.js, mounted directly
+// on the Express `app` (not this router) — they must be at the root path.
+//
+// ⚠️ NOTE (Google button): loading https://accounts.google.com/gsi/client
+// requires helmet's CSP to allow script-src/connect-src/frame-src from
+// accounts.google.com — see the app.js CSP snippet below this file.
 // -----------------------------------------------------------------------
 
 const ACCESS_TOKEN_EXPIRES_IN = process.env.MCP_ACCESS_TOKEN_EXPIRES_IN || '30d';
 const AUTH_CODE_TTL_MS = 10 * 60 * 1000;
-// ⚠️ NEW: diamonds awarded on the very first MCP connect per account.
-// Matches the "20 free credits jab user connect kare" requirement.
 const MCP_FIRST_CONNECT_DIAMONDS = 20;
 
 const generateOpaqueToken = () => crypto.randomBytes(32).toString('hex');
@@ -52,14 +60,31 @@ const verifyPkce = (codeVerifier, codeChallenge, method) => {
   return base64UrlEncode(hash) === codeChallenge;
 };
 
+// Shared by both the password flow (POST /authorize) and the Google flow
+// (POST /google) — validates the client + redirect_uri, then mints an
+// authorization code exactly the same way for either login method.
+const issueAuthCode = async ({ client_id, redirect_uri, state, code_challenge, code_challenge_method, userId }) => {
+  const code = generateOpaqueToken();
+  await OAuthCode.create({
+    code,
+    user: userId,
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    codeChallenge: code_challenge,
+    codeChallengeMethod: code_challenge_method || 'S256'
+  });
+
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set('code', code);
+  if (state) redirectUrl.searchParams.set('state', state);
+  return redirectUrl.toString();
+};
+
 // -----------------------------------------------------------------------
 // Dynamic Client Registration (RFC 7591) — Claude/ChatGPT call this once,
 // automatically, the first time anyone tries to add the TubePilot
 // connector. Returns a client_id they'll use for every /authorize call
-// after that. No auth required on this endpoint (that's normal for public
-// client registration) — but redirect_uris are still validated at
-// /authorize time against exactly what was registered here, so a stolen
-// client_id alone can't redirect a code somewhere else.
+// after that.
 // -----------------------------------------------------------------------
 router.post('/register', async (req, res) => {
   try {
@@ -71,7 +96,7 @@ router.post('/register', async (req, res) => {
     const clientId = crypto.randomBytes(16).toString('hex');
     await OAuthClient.create({
       clientId,
-      clientSecret: null, // public client — PKCE only, matches Claude/ChatGPT's connector model
+      clientSecret: null,
       clientName: client_name || 'MCP Client',
       redirectUris: redirect_uris
     });
@@ -90,13 +115,10 @@ router.post('/register', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------
-// GET /oauth/authorize — renders the actual login+consent page (opens in
-// the user's browser, launched by Claude/ChatGPT).
-//
-// ⚠️ FIX: added a "Don't have an account? Sign up" link pointing to the
-// TubePilot app/website so new users aren't stranded on a login-only page
-// with no way to create an account. Also added a "Forgot password?" link
-// for existing users who can't remember their credentials.
+// GET /oauth/authorize — renders the login+consent page. Now shows a
+// Google Sign-In button ABOVE the email/password form (matching the
+// TubePilot app's own signup screen: Google first, "or continue with
+// email" divider, then the form).
 // -----------------------------------------------------------------------
 router.get('/authorize', async (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
@@ -113,8 +135,6 @@ router.get('/authorize', async (req, res) => {
     return res.status(400).send('Unknown client or redirect_uri does not match what was registered.');
   }
 
-  // App store / website link for the signup CTA — falls back to a generic
-  // Play Store search if PUBLIC_APP_STORE_URL isn't set in .env yet.
   const appStoreUrl = process.env.PUBLIC_APP_STORE_URL || 'https://play.google.com/store/search?q=tubepilot';
   const forgotPasswordUrl = process.env.PUBLIC_FORGOT_PASSWORD_URL || `${process.env.PUBLIC_FRONTEND_URL || 'https://tubepilot.app'}/forgot-password`;
 
@@ -124,6 +144,7 @@ router.get('/authorize', async (req, res) => {
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Connect TubePilot</title>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body {
@@ -159,9 +180,8 @@ router.get('/authorize', async (req, res) => {
       align-items: center;
       justify-content: center;
       color: #fff;
-      font-size: 20px;
-      font-weight: 800;
     }
+    .logo-circle svg { width: 20px; height: 20px; }
     .logo-name {
       font-size: 20px;
       font-weight: 800;
@@ -180,7 +200,6 @@ router.get('/authorize', async (req, res) => {
       margin: 0 0 22px;
       line-height: 1.5;
     }
-    /* ⚠️ NEW: first-connect benefit banner */
     .benefit-banner {
       background: linear-gradient(135deg, #f3e8ff, #ede9fe);
       border: 1px solid #ddd6fe;
@@ -194,6 +213,26 @@ router.get('/authorize', async (req, res) => {
     .benefit-banner .gem { font-size: 22px; }
     .benefit-banner .text { font-size: 12.5px; color: #4a1d5c; line-height: 1.45; }
     .benefit-banner .text strong { display: block; font-weight: 700; }
+    #google-signin-btn {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 18px;
+      min-height: 44px;
+    }
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 18px;
+      color: #ccc;
+      font-size: 12px;
+    }
+    .divider::before, .divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: #e5e7eb;
+    }
     label {
       display: block;
       font-size: 12px;
@@ -245,25 +284,11 @@ router.get('/authorize', async (req, res) => {
       padding: 10px 14px;
       margin-bottom: 14px;
     }
-    .divider {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin: 20px 0 16px;
-      color: #ccc;
-      font-size: 12px;
-    }
-    .divider::before, .divider::after {
-      content: '';
-      flex: 1;
-      height: 1px;
-      background: #e5e7eb;
-    }
-    /* ⚠️ NEW: signup CTA block */
     .signup-cta {
       text-align: center;
       font-size: 13px;
       color: #666;
+      margin-top: 16px;
     }
     .signup-cta a {
       color: #7c3aed;
@@ -277,20 +302,23 @@ router.get('/authorize', async (req, res) => {
       line-height: 1.5;
       text-align: center;
     }
+    #google-error {
+      display: none;
+    }
   </style>
 </head>
 <body>
   <div class="card">
     <div class="logo-row">
-      <div class="logo-circle">T</div>
+      <div class="logo-circle">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      </div>
       <div class="logo-name">Tube<span>Pilot</span></div>
     </div>
 
     <h2>Connect to AI Assistant 💎</h2>
     <p class="sub">Log in to allow this assistant to generate titles, descriptions, hashtags, and schedule videos on your behalf.</p>
 
-    <!-- ⚠️ NEW: 20 diamonds benefit callout shown on the login page so
-         users know connecting gives them free credits -->
     <div class="benefit-banner">
       <div class="gem">💎</div>
       <div class="text">
@@ -298,6 +326,13 @@ router.get('/authorize', async (req, res) => {
         Log in to your TubePilot account and get 20 diamonds added automatically — use them for AI titles, descriptions, or uploads.
       </div>
     </div>
+
+    <div id="google-error" class="error-box"></div>
+
+    <!-- ⚠️ NEW: Google Sign-In button, rendered by Google's own script -->
+    <div id="google-signin-btn"></div>
+
+    <div class="divider">or continue with email</div>
 
     <form method="POST" action="/oauth/authorize">
       <input type="hidden" name="client_id" value="${client_id}" />
@@ -319,10 +354,6 @@ router.get('/authorize', async (req, res) => {
       <button type="submit">Log in &amp; Connect</button>
     </form>
 
-    <div class="divider">or</div>
-
-    <!-- ⚠️ NEW: signup CTA — new users who land here from Claude/ChatGPT
-         need a way to create a TubePilot account before they can connect -->
     <div class="signup-cta">
       Don't have an account?
       <a href="${appStoreUrl}" target="_blank" rel="noopener">Download TubePilot &amp; Sign up →</a>
@@ -333,20 +364,65 @@ router.get('/authorize', async (req, res) => {
       free credits and diamond balance apply exactly as in the app.
     </p>
   </div>
+
+  <script>
+    // Reads client_id/redirect_uri/state/code_challenge from the
+    // already-rendered hidden form fields (not by re-interpolating them
+    // into this script) so nothing here can break out of the JS string.
+    function handleGoogleCredential(response) {
+      var form = document.querySelector('form');
+      var errorBox = document.getElementById('google-error');
+      errorBox.style.display = 'none';
+
+      fetch('/oauth/google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          idToken: response.credential,
+          client_id: form.client_id.value,
+          redirect_uri: form.redirect_uri.value,
+          state: form.state.value,
+          code_challenge: form.code_challenge.value,
+          code_challenge_method: form.code_challenge_method.value
+        })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.redirect) {
+            window.location.href = data.redirect;
+          } else {
+            errorBox.textContent = data.error_description || 'Google sign-in failed. Please try again.';
+            errorBox.style.display = 'block';
+          }
+        })
+        .catch(function () {
+          errorBox.textContent = 'Google sign-in failed. Please try again.';
+          errorBox.style.display = 'block';
+        });
+    }
+
+    window.onload = function () {
+      if (!window.google || !window.google.accounts) return; // CSP or network blocked the script — email form still works
+      google.accounts.id.initialize({
+        client_id: '${process.env.GOOGLE_CLIENT_ID}',
+        callback: handleGoogleCredential
+      });
+      google.accounts.id.renderButton(
+        document.getElementById('google-signin-btn'),
+        { theme: 'outline', size: 'large', shape: 'pill', width: 336, text: 'continue_with', logo_alignment: 'left' }
+      );
+    };
+  </script>
 </body>
 </html>`);
 });
 
 // -----------------------------------------------------------------------
-// POST /oauth/authorize — the login form's submit target. Verifies
-// credentials the same way the app's normal email/password login does
-// (User.comparePassword, from models/User.js), then issues a short-lived
-// authorization code and redirects back to Claude/ChatGPT.
+// POST /oauth/authorize — email/password submit target.
 // -----------------------------------------------------------------------
 router.post('/authorize', express.urlencoded({ extended: true }), async (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, identifier, password } = req.body;
 
-  // App store URL reused in the "go back" error page's signup link.
   const appStoreUrl = process.env.PUBLIC_APP_STORE_URL || 'https://play.google.com/store/search?q=tubepilot';
 
   try {
@@ -395,42 +471,79 @@ router.post('/authorize', express.urlencoded({ extended: true }), async (req, re
       return res.status(403).send('This account is inactive. Please contact TubePilot support.');
     }
 
-    const code = generateOpaqueToken();
-    await OAuthCode.create({
-      code,
-      user: user._id,
-      clientId: client_id,
-      redirectUri: redirect_uri,
-      codeChallenge: code_challenge,
-      codeChallengeMethod: code_challenge_method || 'S256'
-    });
-
-    const redirectUrl = new URL(redirect_uri);
-    redirectUrl.searchParams.set('code', code);
-    if (state) redirectUrl.searchParams.set('state', state);
-
-    res.redirect(redirectUrl.toString());
+    const redirectUrl = await issueAuthCode({ client_id, redirect_uri, state, code_challenge, code_challenge_method, userId: user._id });
+    res.redirect(redirectUrl);
   } catch (err) {
     res.status(500).send(`Server error: ${err.message}`);
   }
 });
 
 // -----------------------------------------------------------------------
+// POST /oauth/google — the Google button's target. Same user lookup/
+// create logic as /api/auth/google in routes/auth.js (find by googleId,
+// fall back to email, create if neither exists), but instead of issuing a
+// TubePilot access token directly, it issues an OAuth authorization code —
+// same as the password flow — so the rest of the PKCE exchange (POST
+// /token) works identically no matter which login method the user picked.
+// -----------------------------------------------------------------------
+router.post('/google', express.json(), async (req, res) => {
+  try {
+    const { idToken, client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({ error: 'invalid_request', error_description: 'idToken is required' });
+    }
+    if (!client_id || !redirect_uri || !code_challenge) {
+      return res.status(400).json({ error: 'invalid_request', error_description: 'Missing OAuth parameters' });
+    }
+
+    const client = await OAuthClient.findOne({ clientId: client_id });
+    if (!client || !client.redirectUris.includes(redirect_uri)) {
+      return res.status(400).json({ error: 'invalid_client', error_description: 'Unknown client or redirect_uri mismatch' });
+    }
+
+    const ticket = await googleClient.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+
+    let user = await User.findOne({ googleId: payload.sub });
+    if (!user) {
+      user = await User.findOne({ email: payload.email });
+    }
+
+    if (!user) {
+      const userId = await generateUserId();
+      const referralCode = await generateReferralCode(userId);
+      user = await User.create({
+        userId,
+        name: payload.name,
+        email: payload.email,
+        avatar: payload.picture,
+        googleId: payload.sub,
+        authProvider: 'google',
+        referralCode,
+        freeUploadsRemaining: Number(process.env.FREE_UPLOADS_PER_MONTH || 20)
+      });
+    } else if (!user.googleId) {
+      user.googleId = payload.sub;
+      user.authProvider = 'google';
+      await user.save();
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({ error: 'access_denied', error_description: 'This account is inactive. Please contact TubePilot support.' });
+    }
+
+    const redirectUrl = await issueAuthCode({ client_id, redirect_uri, state, code_challenge, code_challenge_method, userId: user._id });
+    res.json({ redirect: redirectUrl });
+  } catch (err) {
+    res.status(401).json({ error: 'access_denied', error_description: 'Google authentication failed: ' + err.message });
+  }
+});
+
+// -----------------------------------------------------------------------
 // POST /oauth/token — exchanges the authorization code (+ PKCE verifier)
-// for a real access token.
-//
-// ⚠️ FIX (Boss request — "connect karte hi 20 free diamonds mile"):
-// On the VERY FIRST successful MCP token exchange for a user account, we
-// credit MCP_FIRST_CONNECT_DIAMONDS (20) diamonds — but only once, guarded
-// by a `mcpConnectedAt` field on the User document so repeat connects
-// (e.g. token refresh, reconnect after revoke) never double-credit.
-//
-// This is done here in /token (not in /authorize's POST handler) because
-// /token is the step where we KNOW the full OAuth round-trip succeeded —
-// the user logged in, the code was issued, AND the code was correctly
-// verified with PKCE. Crediting here means no diamonds are awarded if the
-// user logs in but Claude/ChatGPT never complete the exchange (e.g. they
-// closed the tab mid-flow).
+// for a real access token. Works identically whether the code came from
+// the password flow or the Google flow, since both call issueAuthCode().
 // -----------------------------------------------------------------------
 router.post('/token', express.urlencoded({ extended: true }), express.json(), async (req, res) => {
   try {
@@ -463,9 +576,6 @@ router.post('/token', express.urlencoded({ extended: true }), express.json(), as
         return res.status(400).json({ error: 'invalid_grant', error_description: 'User not found or inactive' });
       }
 
-      // ⚠️ NEW — first-connect diamond bonus. `mcpConnectedAt` is set once
-      // and never overwritten, so this branch only runs on the very first
-      // successful token exchange per account.
       if (!user.mcpConnectedAt) {
         user.mcpConnectedAt = new Date();
         user.diamondBalance = (user.diamondBalance || 0) + MCP_FIRST_CONNECT_DIAMONDS;
@@ -480,7 +590,7 @@ router.post('/token', express.urlencoded({ extended: true }), express.json(), as
       return res.json({
         access_token: accessToken,
         token_type: 'Bearer',
-        expires_in: 60 * 60 * 24 * 30, // 30 days, matches ACCESS_TOKEN_EXPIRES_IN default
+        expires_in: 60 * 60 * 24 * 30,
         refresh_token: refreshTokenValue,
         scope: 'tubepilot'
       });
@@ -500,7 +610,7 @@ router.post('/token', express.urlencoded({ extended: true }), express.json(), as
         access_token: accessToken,
         token_type: 'Bearer',
         expires_in: 60 * 60 * 24 * 30,
-        refresh_token, // rotate later if you want stricter security; kept stable for now
+        refresh_token,
         scope: 'tubepilot'
       });
     }
