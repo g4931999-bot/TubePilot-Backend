@@ -169,13 +169,17 @@ const generateCaption = async (topic, platform) => {
   return callGroq(systemPrompt, `Video/Reel topic: ${topic}`);
 };
 
+// YouTube hashtag prompt added so the AI Title/Description/Hashtags
+// generator screen can call this with platform: 'youtube'. Instagram and
+// Facebook prompts unchanged.
 const HASHTAG_PROMPTS = {
+  youtube: 'You are a YouTube SEO expert. Reply with ONLY a comma-separated list of 12 relevant YouTube hashtags for the given video topic (mix of broad and niche tags, usable in the description). No numbering, no extra text, no # symbol.',
   instagram: 'You are a social media growth expert specializing in Instagram Reels. Reply with ONLY a comma-separated list of 20 relevant, trending Instagram hashtags for the given topic (mix of broad and niche tags). No numbering, no extra text, no # symbol.',
   facebook: 'You are a social media growth expert specializing in Facebook video posts. Reply with ONLY a comma-separated list of 8 relevant Facebook hashtags for the given topic. No numbering, no extra text, no # symbol.'
 };
 
 const generateHashtags = async (topic, platform) => {
-  const systemPrompt = HASHTAG_PROMPTS[platform] || HASHTAG_PROMPTS.instagram;
+  const systemPrompt = HASHTAG_PROMPTS[platform] || HASHTAG_PROMPTS.youtube;
   const raw = await callGroq(systemPrompt, `Video/Reel topic: ${topic}`);
   return raw.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
 };
@@ -220,30 +224,27 @@ const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
   }
 };
 
-// ⚠️ UPDATED (Boss request — plan/quota system): now accepts `mode`
-// ('basic' | 'advance'). This is a REAL prompt-depth difference, not just
-// a gate on top of the same output:
-//   'basic'   → lighter system prompt, asks ONLY for seoScore + breakdown
-//               (titleScore/descScore/tagScore). No recommendedTags, no
-//               notes, no competitor angle — cheaper AND intentionally
-//               less actionable, matching the ₹50 tier.
-//   'advance' → the full original analysis PLUS a new competitorGapNotes
-//               field: 1-2 sentences on what a top-ranking video in this
-//               niche likely does better, matching the ₹100/₹200 tiers.
-// Defaults to 'advance' when mode isn't passed, so any existing caller
-// that doesn't pass mode keeps today's full behavior unchanged.
+// Accepts `mode` ('basic' | 'advance'). Real prompt-depth difference, not
+// just a gate on top of the same output. Both modes now ask for an
+// "issues" array — 3-6 SPECIFIC problems with THIS exact title/description
+// /tags (not generic advice) — since Video SEO Optimizer unlocks for ANY
+// paid pack (mode is never 'none' when this is called from that route), so
+// "what's wrong with this video" needs to work at both basic and advance.
+// Only the deeper fields (recommendedTags / notes / competitorGapNotes)
+// stay advance-only.
 const analyzeSeoScore = async ({ title, description, tags = [], platform = 'youtube', mode = 'advance' }) => {
   const basicSystemPrompt =
-    `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags at a high level. ` +
-    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}}. ' +
+    `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags at a high level, and list concrete problems with them. ` +
+    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "issues": [string]}. ' +
     'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
-    'tagScore weighs relevance and coverage breadth. No markdown, no extra text.';
+    'tagScore weighs relevance and coverage breadth. "issues" is 3-6 SPECIFIC problems with THIS exact title/description/tags (e.g. exact char counts, missing hook, too few tags) — not generic tips. No markdown, no extra text.';
 
   const advanceSystemPrompt =
-    `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags in depth. ` +
-    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "recommendedTags": [string], "notes": string, "competitorGapNotes": string}. ' +
+    `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags in depth, and list concrete problems with them. ` +
+    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "issues": [string], "recommendedTags": [string], "notes": string, "competitorGapNotes": string}. ' +
     'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
-    'tagScore weighs relevance and coverage breadth. recommendedTags is 5-10 additional tags the creator is missing. ' +
+    'tagScore weighs relevance and coverage breadth. "issues" is 3-6 SPECIFIC problems with THIS exact title/description/tags (e.g. exact char counts, missing hook, too few tags) — not generic tips. ' +
+    'recommendedTags is 5-10 additional tags the creator is missing. ' +
     'competitorGapNotes is 1-2 sentences on what a top-ranking video in this niche likely does better than this one (packaging, pacing, hook strength, etc). No markdown, no extra text.';
 
   const raw = await callGroq(
@@ -260,7 +261,8 @@ const analyzeSeoScore = async ({ title, description, tags = [], platform = 'yout
         titleScore: Math.round(Number(parsed.breakdown?.titleScore) || 0),
         descScore: Math.round(Number(parsed.breakdown?.descScore) || 0),
         tagScore: Math.round(Number(parsed.breakdown?.tagScore) || 0)
-      }
+      },
+      issues: Array.isArray(parsed.issues) ? parsed.issues.slice(0, 6) : []
     };
 
     if (mode === 'basic') {
