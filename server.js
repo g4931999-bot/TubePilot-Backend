@@ -36,8 +36,27 @@ const app = express();
 // Enable reverse proxy trust (Render / Heroku / AWS / Cloudflare)
 app.set('trust proxy', 1);
 
+// -----------------------------------------------------------------------
 // Security Headers
-app.use(helmet());
+// ⚠️ FIX: default helmet() blocks any script/frame/connection that isn't
+// same-origin — that silently breaks the Google Sign-In button on the
+// /oauth/authorize page, which needs to load
+// https://accounts.google.com/gsi/client, render Google's iframe, and
+// call back to accounts.google.com. Everything else keeps helmet's normal
+// safe defaults ('self' for everything not explicitly listed here).
+// -----------------------------------------------------------------------
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "https://accounts.google.com/gsi/client"],
+      styleSrc: ["'self'", "https:", "'unsafe-inline'"],
+      frameSrc: ["https://accounts.google.com"],
+      connectSrc: ["'self'", "https://accounts.google.com"],
+      imgSrc: ["'self'", "data:", "https://*.googleusercontent.com"]
+    }
+  }
+}));
 
 // Dynamic CORS Configuration
 const allowedOrigins = (process.env.FRONTEND_URL || '')
@@ -83,7 +102,7 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256', 'plain'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
-    scopes_supported: ['tubepilot'] // ⚠️ NEW — matches the "scope" value /oauth/token already returns
+    scopes_supported: ['tubepilot']
   });
 });
 
@@ -111,11 +130,14 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
-// ⚠️ NEW — /oauth/authorize (POST) is where email/password is verified for
-// the MCP connector login screen, exactly like /api/auth/login. Without
-// this it sat completely outside globalLimiter's '/api/' scope too, so it
-// had ZERO brute-force protection while the normal login did.
+// /oauth/authorize (POST) is where email/password is verified for the MCP
+// connector login screen, exactly like /api/auth/login — without this it
+// sat completely outside globalLimiter's '/api/' scope too, so it had ZERO
+// brute-force protection while the normal login did.
 app.use('/oauth/authorize', authLimiter);
+// Google flow bypasses password guessing entirely (Google verifies the
+// credential), but still rate-limit it against abuse/spam of the endpoint.
+app.use('/oauth/google', authLimiter);
 
 // --- API Route Mappings ---
 app.use('/api/auth', authRoutes);
@@ -142,7 +164,7 @@ app.use('/api/payment', diamondRoutes);
 // MCP + OAuth routes.
 // Note: /.well-known/* are already mounted directly on `app` above —
 // oauthRoutes no longer contains those handlers (removed from oauth.js),
-// so /oauth only handles /authorize, /token, /register.
+// so /oauth only handles /authorize, /google, /token, /register.
 // -----------------------------------------------------------------------
 app.use('/oauth', oauthRoutes);
 app.use('/mcp', require('./routes/mcp'));
