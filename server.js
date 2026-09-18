@@ -29,6 +29,7 @@ const analyticsRoutes = require('./routes/analytics');
 const ratingsRoutes = require('./routes/ratings');
 const seedAdminRoute = require('./routes/seedAdmin');
 const uploadsRoutes = require('./routes/uploads');
+const oauthRoutes = require('./routes/oauth');
 
 const app = express();
 
@@ -59,17 +60,51 @@ app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(cookieParser());
 
+// -----------------------------------------------------------------------
+// ⚠️ FIX (Critical — MCP connector discovery): Claude and ChatGPT both
+// probe /.well-known/oauth-authorization-server and
+// /.well-known/oauth-protected-resource automatically when a user tries
+// to connect TubePilot. These MUST be at the ROOT path — not under /oauth.
+// Previously they were on the /oauth router, which made them land at
+// /oauth/.well-known/... and Claude/ChatGPT could never find them, so the
+// connector never appeared in the store / connect flow.
+//
+// Mounted here directly on `app`, BEFORE any rate limiters, so discovery
+// probes are never accidentally rate-limited.
+// -----------------------------------------------------------------------
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
+  const base = process.env.PUBLIC_BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    registration_endpoint: `${base}/oauth/register`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    code_challenge_methods_supported: ['S256', 'plain'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post']
+  });
+});
+
+app.get('/.well-known/oauth-protected-resource', (req, res) => {
+  const base = process.env.PUBLIC_BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+  res.json({
+    resource: `${base}/mcp`,
+    authorization_servers: [base]
+  });
+});
+
 // Rate Limiters
-const globalLimiter = rateLimit({ 
-  windowMs: 15 * 60 * 1000, 
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
   max: 500,
   standardHeaders: true,
   legacyHeaders: false
 });
 app.use('/api/', globalLimiter);
 
-const authLimiter = rateLimit({ 
-  windowMs: 15 * 60 * 1000, 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
   max: 20,
   message: { success: false, message: 'Too many login attempts. Please try again in 15 minutes.' }
 });
@@ -97,11 +132,14 @@ app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
 
-// Mcp
-
-app.use('/oauth', require('./routes/oauth'));
+// -----------------------------------------------------------------------
+// MCP + OAuth routes.
+// Note: /.well-known/* are already mounted directly on `app` above —
+// oauthRoutes no longer contains those handlers (removed from oauth.js),
+// so /oauth only handles /authorize, /token, /register.
+// -----------------------------------------------------------------------
+app.use('/oauth', oauthRoutes);
 app.use('/mcp', require('./routes/mcp'));
-
 
 // Management & Analytics
 app.use('/api/wallet', walletRoutes);
@@ -121,8 +159,8 @@ if (require('fs').existsSync('./routes/posts.js')) {
 }
 
 // Health Check Endpoint
-app.get('/api/health', (req, res) => res.json({ 
-  success: true, 
+app.get('/api/health', (req, res) => res.json({
+  success: true,
   status: 'healthy',
   message: 'TubePilot Production API is running smoothly',
   timestamp: new Date().toISOString()
@@ -134,14 +172,14 @@ app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'A
 // Global Centralized Error Handler
 app.use((err, req, res, next) => {
   console.error('❌ [Global Server Error]:', err.stack || err.message);
-  
+
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ success: false, message: 'CORS policy blocked this request' });
   }
 
-  res.status(err.status || 500).json({ 
-    success: false, 
-    message: err.message || 'Internal Server Error' 
+  res.status(err.status || 500).json({
+    success: false,
+    message: err.message || 'Internal Server Error'
   });
 });
 
