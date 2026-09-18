@@ -49,7 +49,7 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "https://accounts.google.com/gsi/client"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://accounts.google.com/gsi/client"],
       styleSrc: ["'self'", "https:", "'unsafe-inline'"],
       frameSrc: ["https://accounts.google.com"],
       connectSrc: ["'self'", "https://accounts.google.com"],
