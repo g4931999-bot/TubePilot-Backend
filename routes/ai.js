@@ -126,12 +126,15 @@ router.post('/caption', protect, async (req, res) => {
   }
 });
 
+// 'youtube' added to the allowed platform list, so the AI Title/
+// Description/Hashtags generator screen can call this with
+// platform: 'youtube'. instagram/facebook unchanged.
 router.post('/hashtags', protect, async (req, res) => {
   try {
     const { topic, platform } = req.body;
     if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
-    if (!['instagram', 'facebook'].includes(platform)) {
-      return res.status(400).json({ success: false, message: 'platform must be instagram or facebook' });
+    if (!['youtube', 'instagram', 'facebook'].includes(platform)) {
+      return res.status(400).json({ success: false, message: 'platform must be youtube, instagram, or facebook' });
     }
 
     await chargeDiamonds(req.user, AI_FEATURE_COST.hashtags);
@@ -158,17 +161,17 @@ router.post('/ideas', protect, async (req, res) => {
 });
 
 // @route POST /api/ai/seo-score  { title, description?, tags?, platform? }
-// ⚠️ UPDATED (Boss request — plan/quota system): gated behind
-// req.user.seoScoreLevel now, on top of the existing diamond charge.
-// tier 1 (seoScoreLevel:'none') → blocked entirely, must upgrade plan.
-// tier 2 ('basic') / tier 3+ ('advance') → mode passed into analyzeSeoScore
-// so the AI prompt itself can go deeper for advance (utils/groq.js should
-// branch on `mode` inside analyzeSeoScore — flag this to me if it doesn't
-// accept a mode param yet, I'll update utils/groq.js too).
+// Video SEO Optimizer gate: unlocks for ANY paid pack
+// (seoScoreLevel !== 'none'). tier1 (₹10) sets seoScoreLevel: 'basic' in
+// diamond.js, so ₹10 buyers already get full issues + score here. This is
+// a DIFFERENT (looser) threshold than the Channel SEO Score gate in
+// analytics.js's /audit route, which requires 'advance' (₹100+) — two
+// separate screens, two separate thresholds, both reading the same
+// seoScoreLevel field.
 router.post('/seo-score', protect, async (req, res) => {
   try {
     if (req.user.seoScoreLevel === 'none') {
-      return res.status(402).json({ success: false, message: 'SEO Score Analysis is not included in your current plan. Please upgrade from the Diamond Store.', code: 'PLAN_UPGRADE_REQUIRED' });
+      return res.status(402).json({ success: false, message: 'Video SEO Optimizer is not included in your current plan. Please upgrade from the Diamond Store.', code: 'PLAN_UPGRADE_REQUIRED' });
     }
 
     const { title, description, tags, platform = 'youtube' } = req.body;
@@ -185,9 +188,7 @@ router.post('/seo-score', protect, async (req, res) => {
 });
 
 // @route POST /api/ai/thumbnail-prompt  { topic }
-// ⚠️ NEW (Boss request — plan/quota system): no existing route generated
-// this before, only the audit-recommendation prompts in analytics.js. This
-// is quota-based, NOT diamond-charged — each purchase sets a fixed count
+// Quota-based, NOT diamond-charged — each purchase sets a fixed count
 // (thumbnailPromptsRemaining) and every call here decrements it by 1 until
 // it hits 0, then the user must buy a new package to reset the quota.
 router.post('/thumbnail-prompt', protect, async (req, res) => {
