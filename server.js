@@ -46,6 +46,13 @@ app.set('trust proxy', 1);
 // safe defaults ('self' for everything not explicitly listed here).
 // -----------------------------------------------------------------------
 app.use(helmet({
+  // ⚠️ FIX: helmet's default Cross-Origin-Opener-Policy is 'same-origin',
+  // which silently breaks Google Sign-In's popup — the popup
+  // (accounts.google.com/gsi/transform) can no longer message its opener
+  // window to pass the credential back, so it just sits blank forever.
+  // 'same-origin-allow-popups' keeps the same protection for everything
+  // else while letting that one popup communicate back.
+  crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
