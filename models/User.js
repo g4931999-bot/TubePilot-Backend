@@ -87,13 +87,20 @@ const UserSchema = new mongoose.Schema({
     expiresAt: { type: Date, default: null }
   },
 
-  // ⚠️ NEW (Boss request — plan/quota system, replaces "same features at
-  // every price" issue): whichever Diamond Store package the user last
-  // purchased decides feature access, not just wallet balance. Set only
-  // inside creditApprovedTransaction() in routes/diamond.js at the moment
-  // a purchase is approved — never incremented, always REPLACED, since a
-  // new purchase means a new plan (see routes/diamond.js comment).
-  activeTier: { type: Number, default: 0 }, // 0 = no plan yet, 1..4 = package index+1
+  // Plan/quota system — whichever Diamond Store package the user last
+  // purchased decides feature access. Set only inside
+  // creditApprovedTransaction() in routes/diamond.js at the moment a
+  // purchase is approved — never incremented, always REPLACED, since a
+  // new purchase means a new plan.
+  //
+  // seoScoreLevel powers TWO different gates in the app:
+  //   - Video SEO Optimizer (routes/ai.js /seo-score): unlocks for ANY
+  //     value other than 'none' — i.e. even the ₹10 pack ('basic') opens
+  //     full copy/suggest.
+  //   - Channel SEO Score (routes/analytics.js /audit): unlocks ONLY when
+  //     this equals 'advance' (₹100+ packs) — a stricter threshold set
+  //     directly in that route, not by this field's name.
+  activeTier: { type: Number, default: 0 }, // 0 = no plan yet, 1..4 = package tier
   thumbnailPromptsRemaining: { type: Number, default: 0 },
   seoScoreLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
   competitorLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
