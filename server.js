@@ -33,25 +33,33 @@ const oauthRoutes = require('./routes/oauth');
 
 const app = express();
 
+// -----------------------------------------------------------------------
+// ⚠️ NEW: process-level safety nets. Without these, an unhandled promise
+// rejection or a thrown error outside of an Express route handler (e.g.
+// inside a cron job, a DB driver callback, etc.) can crash the whole
+// process SILENTLY on some Node/Render setups, or print nothing useful.
+// These guarantee a full stack trace always lands in Render's logs before
+// anything else happens.
+// -----------------------------------------------------------------------
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ [Unhandled Rejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ [Uncaught Exception]', err && err.stack ? err.stack : err);
+  // Intentionally NOT calling process.exit() here — on Render, an
+  // uncaught exception during a single request handling a crash would
+  // otherwise kill the whole server for all users. We log and keep going;
+  // if this fires often, that's itself a signal something needs a proper
+  // try/catch added at the source.
+});
+
 // Enable reverse proxy trust (Render / Heroku / AWS / Cloudflare)
 app.set('trust proxy', 1);
 
 // -----------------------------------------------------------------------
 // Security Headers
-// ⚠️ FIX: default helmet() blocks any script/frame/connection that isn't
-// same-origin — that silently breaks the Google Sign-In button on the
-// /oauth/authorize page, which needs to load
-// https://accounts.google.com/gsi/client, render Google's iframe, and
-// call back to accounts.google.com. Everything else keeps helmet's normal
-// safe defaults ('self' for everything not explicitly listed here).
 // -----------------------------------------------------------------------
 app.use(helmet({
-  // ⚠️ FIX: helmet's default Cross-Origin-Opener-Policy is 'same-origin',
-  // which silently breaks Google Sign-In's popup — the popup
-  // (accounts.google.com/gsi/transform) can no longer message its opener
-  // window to pass the credential back, so it just sits blank forever.
-  // 'same-origin-allow-popups' keeps the same protection for everything
-  // else while letting that one popup communicate back.
   crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
   contentSecurityPolicy: {
     directives: {
@@ -86,18 +94,20 @@ app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(cookieParser());
 
-// -----------------------------------------------------------------------
-// ⚠️ FIX (Critical — MCP connector discovery): Claude and ChatGPT both
-// probe /.well-known/oauth-authorization-server and
-// /.well-known/oauth-protected-resource automatically when a user tries
-// to connect TubePilot. These MUST be at the ROOT path — not under /oauth.
-// Previously they were on the /oauth router, which made them land at
-// /oauth/.well-known/... and Claude/ChatGPT could never find them, so the
-// connector never appeared in the store / connect flow.
-//
-// Mounted here directly on `app`, BEFORE any rate limiters, so discovery
-// probes are never accidentally rate-limited.
-// -----------------------------------------------------------------------
+// ⚠️ NEW: lightweight request logger scoped to /mcp and /oauth only (not
+// every route, to keep logs readable) — confirms requests are actually
+// reaching the process, with what content-type/body they arrived with,
+// before any route-specific logic runs.
+app.use(['/mcp', '/oauth'], (req, res, next) => {
+  console.log(
+    '[REQ]', new Date().toISOString(),
+    req.method, req.originalUrl,
+    'content-type:', req.headers['content-type'],
+    'has-auth-header:', !!req.headers.authorization
+  );
+  next();
+});
+
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
   const base = process.env.PUBLIC_BACKEND_URL || `${req.protocol}://${req.get('host')}`;
   res.json({
@@ -137,13 +147,7 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
-// /oauth/authorize (POST) is where email/password is verified for the MCP
-// connector login screen, exactly like /api/auth/login — without this it
-// sat completely outside globalLimiter's '/api/' scope too, so it had ZERO
-// brute-force protection while the normal login did.
 app.use('/oauth/authorize', authLimiter);
-// Google flow bypasses password guessing entirely (Google verifies the
-// credential), but still rate-limit it against abuse/spam of the endpoint.
 app.use('/oauth/google', authLimiter);
 
 // --- API Route Mappings ---
@@ -152,31 +156,21 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/youtube', youtubeRoutes);
 app.use('/api/drive', driveRoutes);
 
-// Meta / Facebook Routes (Primary & Fallback Multi-Prefix Support)
 app.use('/api/meta', metaRoutes);
 app.use('/api/facebook', metaRoutes);
 app.use('/api/meta/facebook', metaRoutes);
 
-// Video Routes
 app.use('/', require('./routes/share'));
 app.use('/api/videos', videoRoutes);
 app.use('/api/video', videoRoutes);
 
-// Diamond & Payment Routes
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
 
-// -----------------------------------------------------------------------
-// MCP + OAuth routes.
-// Note: /.well-known/* are already mounted directly on `app` above —
-// oauthRoutes no longer contains those handlers (removed from oauth.js),
-// so /oauth only handles /authorize, /google, /token, /register.
-// -----------------------------------------------------------------------
 app.use('/oauth', oauthRoutes);
 app.use('/mcp', require('./routes/mcp'));
 
-// Management & Analytics
 app.use('/api/wallet', walletRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
@@ -185,15 +179,12 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/seed-admin', seedAdminRoute);
 
-// Generic image upload (Instagram Carousel support — returns hosted URLs
-// for POST /api/posts/instagram/carousel to consume)
 app.use('/api/uploads', uploadsRoutes);
 
 if (require('fs').existsSync('./routes/posts.js')) {
   app.use('/api/posts', require('./routes/posts'));
 }
 
-// Health Check Endpoint
 app.get('/api/health', (req, res) => res.json({
   success: true,
   status: 'healthy',
@@ -201,12 +192,14 @@ app.get('/api/health', (req, res) => res.json({
   timestamp: new Date().toISOString()
 }));
 
-// Global 404 Catch-All for API Routes
 app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'API route not found' }));
 
 // Global Centralized Error Handler
 app.use((err, req, res, next) => {
-  console.error('❌ [Global Server Error]:', err.stack || err.message);
+  // ⚠️ NEW: also print the request path/method that caused it, not just
+  // the stack — makes it much faster to match a log line back to a
+  // specific failing call in Render.
+  console.error('❌ [Global Server Error]', req.method, req.originalUrl, '\n', err.stack || err.message);
 
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ success: false, message: 'CORS policy blocked this request' });
