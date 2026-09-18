@@ -97,6 +97,12 @@ app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
 
+// Mcp
+
+app.use('/oauth', require('./routes/oauth'));
+app.use('/mcp', require('./routes/mcp'));
+
+
 // Management & Analytics
 app.use('/api/wallet', walletRoutes);
 app.use('/api/admin', adminRoutes);
