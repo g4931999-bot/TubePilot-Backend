@@ -22,6 +22,8 @@ const router = express.Router();
 const AI_FEATURE_COST = { title: 2, description: 2, hashtags: 2 };
 const DIAMOND_COST_PER_UPLOAD = Number(process.env.DIAMOND_COST_PER_UPLOAD || 10);
 
+const PUBLIC_LOGO_URL = process.env.PUBLIC_APP_LOGO_URL || 'https://www.tubepilot.shop/IMG_20260912_170837.png';
+
 // ⚠️ NEW: tiny logger so every log line from this file is easy to grep in
 // Render ("grep MCP" will find everything below). Logs go to stdout/stderr
 // via console.*, which Render already captures — nothing extra to set up.
@@ -355,7 +357,24 @@ router.post('/', mcpAuth, express.json(), async (req, res) => {
       return res.json(jsonRpcResult(id, {
         protocolVersion: '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: 'tubepilot', version: '1.0.0' }
+        serverInfo: {
+          name: 'tubepilot',
+          title: 'TubePilot',
+          version: '1.0.0',
+          // ⚠️ NEW: server icon, per MCP spec (SEP-973 — ImplementationSchema.icons).
+          // Not every MCP client renders this yet (Claude.ai's custom-connector
+          // list currently still shows a generic icon in some cases — known
+          // open issue on Anthropic's side), but this is the spec-compliant
+          // way to advertise it and it will pick up automatically as/when
+          // clients add support (already works in some other MCP hosts).
+          icons: [
+            {
+              src: PUBLIC_LOGO_URL,
+              mimeType: 'image/png',
+              sizes: ['512x512']
+            }
+          ]
+        }
       }));
     }
 
