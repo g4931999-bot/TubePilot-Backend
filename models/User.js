@@ -107,7 +107,10 @@ const UserSchema = new mongoose.Schema({
 
   refreshTokens: [{ type: String }],
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
-  isActive: { type: Boolean, default: true }
+  isActive: { type: Boolean, default: true },
+
+  // OAuth flow completion timestamp — set in oauth.js when MCP connection succeeds
+  mcpConnectedAt: { type: Date, default: null }
 }, { timestamps: true });
 
 UserSchema.pre('save', async function (next) {
