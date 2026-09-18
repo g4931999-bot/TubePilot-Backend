@@ -9,36 +9,44 @@ const GiftCode = require('../models/GiftCode');
 
 const router = express.Router();
 
-// ⚠️ BOSS UPDATE (plan/quota system): every package carries its own
-// tier-level ENTITLEMENTS. This is the real fix for "same features shown
-// at every price" — enforced server-side (ai.js / analytics.js) AND now
-// also reflected honestly in the Diamond Store UI via `features` below.
-//   tier 1 (₹10)  → 1 thumbnail prompt,  SEO: none,      Competitor: none
+// ⚠️ BOSS RULE (final): ANY paid pack — even ₹10 — unlocks full Video SEO
+// Optimizer copy/suggest access. Only a user who has NEVER purchased any
+// pack (seoScoreLevel stays 'none' at the User schema default) sees the
+// locked state there. Channel SEO Score is gated separately and more
+// strictly (only 'advance' / ₹100+ unlocks it — see routes/analytics.js
+// /audit route), even though it reads the SAME seoScoreLevel field.
+//   tier 1 (₹10)  → 1 thumbnail prompt,  SEO: basic,     Competitor: none
 //   tier 2 (₹50)  → 5 thumbnail prompts, SEO: basic,     Competitor: none
 //   tier 3 (₹100) → 10 thumbnail prompts,SEO: advance,   Competitor: basic
 //   tier 4 (₹200) → 20 thumbnail prompts,SEO: advance,   Competitor: advance
 const DIAMOND_PACKAGES_BASE = [
-  { tier: 1, diamonds: 99,  priceINR: 10,  thumbnailPrompts: 1,  seoScoreLevel: 'none',    competitorLevel: 'none' },
+  { tier: 1, diamonds: 99,  priceINR: 10,  thumbnailPrompts: 1,  seoScoreLevel: 'basic',   competitorLevel: 'none' },
   { tier: 2, diamonds: 299, priceINR: 50,  thumbnailPrompts: 5,  seoScoreLevel: 'basic',   competitorLevel: 'none' },
   { tier: 3, diamonds: 599, priceINR: 100, thumbnailPrompts: 10, seoScoreLevel: 'advance', competitorLevel: 'basic' },
   { tier: 4, diamonds: 799, priceINR: 200, thumbnailPrompts: 20, seoScoreLevel: 'advance', competitorLevel: 'advance' },
 ];
 
-// ⚠️ NEW: builds the honest "What's included" list the Flutter screen
-// renders directly (no more static facilityKeys on the frontend). Every
-// package gets the SAME 5 rows in the SAME order, each with `included`
-// true/false — so a lower tier visibly shows what it's missing (grey
-// cross) instead of silently listing features it doesn't actually grant.
+// Builds the honest "What's included" list the Flutter Diamond Store
+// screen renders directly. Every package gets the SAME rows in the SAME
+// order, each with `included` true/false — so a lower tier visibly shows
+// what it's missing instead of silently listing features it doesn't grant.
+// Video SEO Optimizer line reflects the (basic-unlocks-too) rule; Channel
+// SEO Score line is called out separately since it needs 'advance'.
 const buildFeatureList = (pkg) => [
   { label: 'AI Title Generation', included: true },
   { label: 'AI Description Generation', included: true },
+  { label: 'AI Hashtag Generation', included: true },
   {
     label: pkg.thumbnailPrompts === 1 ? '1 Thumbnail Prompt' : `${pkg.thumbnailPrompts} Thumbnail Prompts`,
     included: pkg.thumbnailPrompts > 0
   },
   {
-    label: pkg.seoScoreLevel === 'none' ? 'SEO Score Analysis' : `SEO Score Analysis (${pkg.seoScoreLevel === 'basic' ? 'Basic' : 'Advance'})`,
+    label: 'Video SEO Optimizer',
     included: pkg.seoScoreLevel !== 'none'
+  },
+  {
+    label: 'Channel SEO Score (Suggestions)',
+    included: pkg.seoScoreLevel === 'advance'
   },
   {
     label: pkg.competitorLevel === 'none' ? 'Competitor Analysing System' : `Competitor Analysing System (${pkg.competitorLevel === 'basic' ? 'Basic' : 'Advance'})`,
@@ -53,6 +61,13 @@ router.get('/packages', protect, (req, res) => {
   res.json({ success: true, packages: DIAMOND_PACKAGES, currentBalance: req.user.diamondBalance, cashfreeEnvironment: CASHFREE_ENV });
 });
 
+/**
+ * Shared "claim + credit" logic. Used by handleVerifyPayment (app poll),
+ * the webhook, and the background auto-check job below — three different
+ * triggers can all race to be the one that confirms a given order, so this
+ * is the ONLY place that ever flips a transaction to 'approved' and
+ * increments diamondBalance / replaces the user's plan fields.
+ */
 const creditApprovedTransaction = async (transactionId, source) => {
   const claimed = await Transaction.findOneAndUpdate(
     { _id: transactionId, status: 'pending' },
