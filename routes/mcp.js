@@ -318,11 +318,36 @@ router.post('/', mcpAuth, express.json(), async (req, res) => {
     bodyIsEmpty: !req.body || Object.keys(req.body).length === 0
   });
 
-  const { jsonrpc, id, method, params } = req.body || {};
+  const body = req.body || {};
+  const { jsonrpc, id, method, params } = body;
+
+  // -----------------------------------------------------------------------
+  // 🔧 FIX (root cause of the "Error occurred during tool execution"
+  // failure): a JSON-RPC *notification* has NO "id" field at all — the
+  // MCP client sends "notifications/initialized" right after every
+  // successful "initialize" call, and per JSON-RPC 2.0 spec the server
+  // MUST NOT send any response to a notification.
+  //
+  // This server was previously falling through to the "unknown method"
+  // branch for it and replying with an HTTP 404 + JSON-RPC error body.
+  // The client treated that invalid/unexpected response as a broken
+  // session and silently restarted the whole handshake — which is
+  // exactly the initialize → notifications/initialized → tools/list loop
+  // seen 3x in the logs, with tools/call never once being reached. After
+  // enough failed retries the client just surfaces a generic tool error.
+  //
+  // Fix: detect "no id field" = notification, and just ack with a bare
+  // 202 Accepted, no body, no JSON-RPC envelope at all.
+  // -----------------------------------------------------------------------
+  const isNotification = !('id' in body);
+  if (isNotification) {
+    log('notification (no response sent, per JSON-RPC spec)', method);
+    return res.status(202).end();
+  }
 
   if (jsonrpc !== '2.0' || !method) {
     log('rejected: bad JSON-RPC envelope', { jsonrpc, method, rawBody: req.body });
-    return res.status(400).json(jsonRpcError(id ?? null, -32600, 'Invalid JSON-RPC request'));
+    return res.status(200).json(jsonRpcError(id ?? null, -32600, 'Invalid JSON-RPC request'));
   }
 
   try {
@@ -344,7 +369,12 @@ router.post('/', mcpAuth, express.json(), async (req, res) => {
       const handler = TOOL_HANDLERS[toolName];
       if (!handler) {
         log('unknown tool requested', toolName);
-        return res.status(404).json(jsonRpcError(id, -32601, `Unknown tool: ${toolName}`));
+        // 🔧 FIX: 200 + JSON-RPC error, not HTTP 404 — same reasoning as
+        // the notification fix above: a non-200 HTTP status on an actual
+        // JSON-RPC response can make the MCP client treat this as a
+        // transport failure instead of a normal JSON-RPC error it can
+        // read and relay to the model.
+        return res.status(200).json(jsonRpcError(id, -32601, `Unknown tool: ${toolName}`));
       }
 
       try {
@@ -363,7 +393,7 @@ router.post('/', mcpAuth, express.json(), async (req, res) => {
     }
 
     log('unknown method', method);
-    return res.status(404).json(jsonRpcError(id, -32601, `Unknown method: ${method}`));
+    return res.status(200).json(jsonRpcError(id, -32601, `Unknown method: ${method}`));
   } catch (err) {
     // ⚠️ NEW: top-level catch-all — if this fires, the bug is in envelope
     // handling itself (not inside a specific tool), so it's logged
