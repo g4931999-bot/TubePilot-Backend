@@ -22,6 +22,7 @@ const metaRoutes = require('./routes/meta');
 const videoRoutes = require('./routes/video');
 const diamondRoutes = require('./routes/diamond');
 const walletRoutes = require('./routes/wallet');
+const liveStreamRoutes = require('./routes/liveStream');
 const adminRoutes = require('./routes/admin');
 const aiRoutes = require('./routes/ai');
 const notificationRoutes = require('./routes/notifications');
@@ -149,7 +150,7 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
 app.use('/oauth/authorize', authLimiter);
 app.use('/oauth/google', authLimiter);
-
+app.use('/api/live-stream', liveStreamRoutes);
 // --- API Route Mappings ---
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
