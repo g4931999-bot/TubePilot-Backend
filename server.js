@@ -150,7 +150,7 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
 app.use('/oauth/authorize', authLimiter);
 app.use('/oauth/google', authLimiter);
-app.use('/api/live-stream', liveStreamRoutes);
+
 // --- API Route Mappings ---
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
@@ -164,6 +164,7 @@ app.use('/api/meta/facebook', metaRoutes);
 app.use('/', require('./routes/share'));
 app.use('/api/videos', videoRoutes);
 app.use('/api/video', videoRoutes);
+app.use('/api/live-stream', liveStreamRoutes);
 
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
