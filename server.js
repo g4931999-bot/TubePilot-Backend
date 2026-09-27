@@ -23,6 +23,7 @@ const videoRoutes = require('./routes/video');
 const diamondRoutes = require('./routes/diamond');
 const walletRoutes = require('./routes/wallet');
 const liveStreamRoutes = require('./routes/liveStream');
+const livePlansRoutes = require('./routes/livePlans');
 const adminRoutes = require('./routes/admin');
 const aiRoutes = require('./routes/ai');
 const notificationRoutes = require('./routes/notifications');
@@ -165,6 +166,7 @@ app.use('/', require('./routes/share'));
 app.use('/api/videos', videoRoutes);
 app.use('/api/video', videoRoutes);
 app.use('/api/live-stream', liveStreamRoutes);
+app.use('/api/live-plans', livePlansRoutes);
 
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
