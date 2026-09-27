@@ -4,22 +4,27 @@ const TransactionSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   userDisplayId: { type: String, required: true },
 
-  type: { type: String, enum: ['diamond_purchase', 'diamond_spend', 'diamond_refund'], default: 'diamond_purchase' },
+  // ⚠️ NEW: 'live_plan_purchase' added for Day Pass / Monthly Pass buys.
+  type: {
+    type: String,
+    enum: ['diamond_purchase', 'diamond_spend', 'diamond_refund', 'live_plan_purchase'],
+    default: 'diamond_purchase'
+  },
 
   diamondPackage: { type: Number, enum: [99, 299, 599, 799], required: function () { return this.type === 'diamond_purchase'; } },
-  amountINR: { type: Number, required: function () { return this.type === 'diamond_purchase'; } },
+  amountINR: { type: Number, required: function () { return this.type === 'diamond_purchase' || this.type === 'live_plan_purchase'; } },
 
-  // Snapshot of the tier's entitlements AT PURCHASE TIME, saved on the
-  // transaction itself. creditApprovedTransaction() can be called by 3
-  // different triggers (app poll / webhook / auto-check job — see
-  // routes/diamond.js), and whichever one fires needs to know what tier
-  // this specific order was for WITHOUT re-deriving it from priceINR.
-  // Kept even if DIAMOND_PACKAGES config changes later — this transaction
-  // stays historically accurate.
   planTier: { type: Number, default: null },
   thumbnailPrompts: { type: Number, default: 0 },
   seoScoreLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
   competitorLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
+
+  // ⚠️ NEW: Live Streaming plan snapshot at purchase time — same reasoning
+  // as planTier/seoScoreLevel above: keep it on the transaction itself so
+  // it stays historically accurate even if LIVE_PLANS config changes later.
+  livePlanCategory: { type: String, enum: ['day', 'month'], default: null },
+  livePlanName: { type: String, default: null }, // e.g. 'Starter', 'Basic'
+  liveHoursGranted: { type: Number, default: 0 }, // in hours (whole number)
 
   diamondsForSpend: { type: Number, default: 0 },
   relatedVideo: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null },
