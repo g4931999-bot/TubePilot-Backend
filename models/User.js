@@ -55,6 +55,36 @@ const MetaPendingPageSchema = new mongoose.Schema({
   }
 }, { _id: false });
 
+// -----------------------------------------------------------------------
+// ⚠️ NEW: Live Streaming plan tracking.
+//
+// planCategory: 'none' | 'day' | 'month'
+//   - 'day'   -> Day Pass (Starter/Standard/Advanced/Pro/Max). Expires at
+//                the end of the SAME calendar day it was purchased on
+//                (Option B — decided by boss), regardless of leftover hours.
+//   - 'month' -> Monthly Pass (Basic/Standard/Advanced/Premium). Valid for
+//                exactly 30 days from purchaseAt (Option B). Hours reset
+//                only via a NEW purchase — there is no free auto-renewal
+//                since Cashfree isn't set up for recurring billing here.
+//
+// hoursAllotted / hoursUsed: tracked in SECONDS internally for precision
+// (see hoursUsedSeconds), exposed as hours to the app.
+//
+// purchaseAt: when this plan was bought — used for both day-expiry
+// (compare calendar date) and month-expiry (purchaseAt + 30 days).
+//
+// freeTrialUsed: every user gets ONE 5-minute free live test, tracked here
+// so it can't be reused.
+// -----------------------------------------------------------------------
+const LiveStreamPlanSchema = new mongoose.Schema({
+  planCategory: { type: String, enum: ['none', 'day', 'month'], default: 'none' },
+  planName: { type: String, default: null }, // e.g. 'Starter', 'Basic' — for display only
+  hoursAllottedSeconds: { type: Number, default: 0 },
+  hoursUsedSeconds: { type: Number, default: 0 },
+  purchaseAt: { type: Date, default: null },
+  freeTrialUsed: { type: Boolean, default: false }
+}, { _id: false });
+
 const UserSchema = new mongoose.Schema({
   userId: { type: String, unique: true, index: true },
   name: { type: String, default: '' },
@@ -88,28 +118,20 @@ const UserSchema = new mongoose.Schema({
   },
 
   // Plan/quota system — whichever Diamond Store package the user last
-  // purchased decides feature access. Set only inside
-  // creditApprovedTransaction() in routes/diamond.js at the moment a
-  // purchase is approved — never incremented, always REPLACED, since a
-  // new purchase means a new plan.
-  //
-  // seoScoreLevel powers TWO different gates in the app:
-  //   - Video SEO Optimizer (routes/ai.js /seo-score): unlocks for ANY
-  //     value other than 'none' — i.e. even the ₹10 pack ('basic') opens
-  //     full copy/suggest.
-  //   - Channel SEO Score (routes/analytics.js /audit): unlocks ONLY when
-  //     this equals 'advance' (₹100+ packs) — a stricter threshold set
-  //     directly in that route, not by this field's name.
+  // purchased decides feature access.
   activeTier: { type: Number, default: 0 }, // 0 = no plan yet, 1..4 = package tier
   thumbnailPromptsRemaining: { type: Number, default: 0 },
   seoScoreLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
   competitorLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
 
+  // ⚠️ NEW: Live Streaming plan (day pass / monthly pass) — completely
+  // separate system from the Diamond Store tiers above.
+  liveStream: { type: LiveStreamPlanSchema, default: () => ({}) },
+
   refreshTokens: [{ type: String }],
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
   isActive: { type: Boolean, default: true },
 
-  // OAuth flow completion timestamp — set in oauth.js when MCP connection succeeds
   mcpConnectedAt: { type: Date, default: null }
 }, { timestamps: true });
 
