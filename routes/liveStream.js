@@ -8,7 +8,7 @@ const {
   uploadBufferToImageKit,
   recordUsage
 } = require('../utils/imagekit');
-const { startYouTubeLiveSession, endYouTubeLiveSession } = require('../utils/youtubeLive');
+const { startYouTubeLiveSession, endYouTubeLiveSession, discardYouTubeLiveSession } = require('../utils/youtubeLive');
 
 const router = express.Router();
 
@@ -134,6 +134,14 @@ router.post('/start', protect, async (req, res) => {
       if (err.code === 'YOUTUBE_NOT_CONNECTED' || err.code === 'YOUTUBE_REAUTH_REQUIRED') {
         return res.status(400).json({ success: false, message: err.message, code: err.code });
       }
+      const reason = err.response?.data?.error?.errors?.[0]?.reason;
+      if (reason === 'liveStreamingNotEnabled') {
+        return res.status(400).json({
+          success: false,
+          code: 'YOUTUBE_LIVE_NOT_ENABLED',
+          message: 'Aapke YouTube channel par live streaming enabled nahi hai. YouTube Studio mein "Go Live" kholkar phone verify karein — enable hone mein 24 ghante lag sakte hain.'
+        });
+      }
       console.error('❌ [liveStream/start] YouTube session banane mein error:', err.response?.data || err.message);
       return res.status(500).json({ success: false, message: 'YouTube live session banane mein error aayi.' });
     }
@@ -141,15 +149,27 @@ router.post('/start', protect, async (req, res) => {
     const streamId = `${req.user._id}_${crypto.randomBytes(4).toString('hex')}`;
 
     // Step 2: EC2 worker ko bolo FFmpeg start kare, isi generated stream key se
-    const ec2Response = await axios.post(
-      `${EC2_WORKER_URL}/start`,
-      { streamId, videoUrl, youtubeStreamKey: youtubeSession.streamKey },
-      { headers: { 'x-worker-secret': WORKER_SECRET_KEY } }
-    );
+    let ec2Response;
+    try {
+      ec2Response = await axios.post(
+        `${EC2_WORKER_URL}/start`,
+        { streamId, videoUrl, youtubeStreamKey: youtubeSession.streamKey },
+        { headers: { 'x-worker-secret': WORKER_SECRET_KEY } }
+      );
+    } catch (ec2Err) {
+      // EC2 tak pahunch hi nahi paye (timeout/refused) ya worker ne error diya —
+      // dono case mein YouTube par bana hua unused broadcast delete karo.
+      await discardYouTubeLiveSession(req.user, youtubeSession.broadcastId);
+      console.error('❌ [liveStream/start] EC2 worker call failed:', ec2Err.code || ec2Err.message);
+      return res.status(502).json({
+        success: false,
+        message: ec2Err.response?.data?.message || 'Streaming server se connect nahi ho paya. Thodi der baad try karein.'
+      });
+    }
 
     if (!ec2Response.data.success) {
-      // EC2 fail ho gaya to YouTube broadcast bhi turant band kar do (orphan na chhode)
-      await endYouTubeLiveSession(req.user, youtubeSession.broadcastId);
+      // EC2 fail ho gaya to YouTube broadcast bhi turant hata do (orphan na chhode)
+      await discardYouTubeLiveSession(req.user, youtubeSession.broadcastId);
       return res.status(500).json({ success: false, message: ec2Response.data.message });
     }
 
