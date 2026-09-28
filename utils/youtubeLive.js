@@ -168,7 +168,27 @@ async function endYouTubeLiveSession(user, broadcastId) {
   }
 }
 
+/**
+ * Jo broadcast kabhi live gaya hi nahi (jaise EC2 connect fail hone par),
+ * use "complete" nahi kar sakte — YouTube sirf live broadcast ko complete
+ * hone deta hai. Aise broadcast ko DELETE karna padta hai, warna wo
+ * YouTube Studio mein "upcoming" bankar pada rehta hai.
+ */
+async function discardYouTubeLiveSession(user, broadcastId) {
+  if (!broadcastId) return;
+  try {
+    const accessToken = await ensureFreshYouTubeToken(user);
+    await axios.delete(`${YOUTUBE_API_BASE}/liveBroadcasts?id=${broadcastId}`, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    console.log(`[YouTube Live] Unused broadcast ${broadcastId} delete kar diya.`);
+  } catch (err) {
+    console.error(`⚠️ [YouTube Live] Broadcast delete failed (ignored):`, err.response?.data?.error?.message || err.message);
+  }
+}
+
 module.exports = {
   startYouTubeLiveSession,
-  endYouTubeLiveSession
+  endYouTubeLiveSession,
+  discardYouTubeLiveSession
 };
