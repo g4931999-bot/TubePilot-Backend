@@ -119,14 +119,25 @@ router.post('/create-order', protect, async (req, res) => {
       cashfreeOrderId: orderId
     });
 
-    const order = await createCashfreeOrder({
-      orderId,
-      amount: plan.priceINR,
-      customerId: userIdentifier,
-      customerPhone: req.user.phone,
-      customerEmail: req.user.email,
-      customerName: req.user.name
-    });
+    let order;
+    try {
+      order = await createCashfreeOrder({
+        orderId,
+        amount: plan.priceINR,
+        customerId: userIdentifier,
+        customerPhone: req.user.phone,
+        customerEmail: req.user.email,
+        customerName: req.user.name
+      });
+    } catch (cfErr) {
+      // Cashfree ne order banaya hi nahi — pending transaction ko turant
+      // rejected mark karo, warna auto-check job 24 ghante tak har minute
+      // is bekaar order ko check karti rahegi.
+      transaction.status = 'rejected';
+      transaction.adminNote = `Cashfree order creation failed: ${cfErr.response?.data?.message || cfErr.message}`;
+      await transaction.save();
+      throw cfErr;
+    }
 
     transaction.paymentSessionId = order.paymentSessionId;
     await transaction.save();
@@ -142,6 +153,10 @@ router.post('/create-order', protect, async (req, res) => {
   } catch (err) {
     if (err.code === 'CASHFREE_NOT_CONFIGURED') {
       return res.status(503).json({ success: false, message: err.message, code: err.code });
+    }
+    if (err.response?.data?.code === 'payment_gateway_inactive') {
+      console.error('❌ [Cashfree/Live] Cashfree account par Payment Gateway activate nahi hai.');
+      return res.status(503).json({ success: false, message: 'Payment abhi available nahi hai. Kripya thodi der baad try karein.' });
     }
     console.error('❌ [Cashfree/Live] create-order failed:', err.response?.data || err.message);
     res.status(500).json({ success: false, message: 'Could not start payment. Please try again.' });
@@ -243,6 +258,16 @@ async function autoCheckPendingLiveOrders() {
     }).limit(50);
 
     for (const transaction of pending) {
+      // paymentSessionId tabhi save hota hai jab Cashfree ne order sach mein
+      // banaya ho. Nahi hai matlab order Cashfree par exist hi nahi karta —
+      // check karne ka koi matlab nahi, seedha rejected mark karo.
+      if (!transaction.paymentSessionId) {
+        await Transaction.findOneAndUpdate(
+          { _id: transaction._id, status: 'pending' },
+          { $set: { status: 'rejected', adminNote: 'Order never created at Cashfree (auto-check)' } }
+        );
+        continue;
+      }
       try {
         const cfOrder = await getCashfreeOrderStatus(transaction.cashfreeOrderId);
         if (cfOrder.order_status === 'PAID') {
