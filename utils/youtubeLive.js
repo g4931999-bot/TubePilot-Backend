@@ -9,11 +9,41 @@
 //   2. liveStreams.insert     -> asli RTMP stream + stream key milta hai
 //   3. liveBroadcasts.bind    -> broadcast aur stream ko jodta hai
 //   4. (stop hone par) liveBroadcasts.transition -> broadcast ko "complete" karta hai
+//
+// ⚠️ UPDATE (limits + old-video live):
+//   - Har YouTube call par timeout (pehle koi timeout nahi tha).
+//   - Session banate waqt beech mein fail ho jaye to jo kuch ban chuka hai
+//     (broadcast/stream) wo khud delete ho jata hai — orphan nahi bachta.
+//   - discardYouTubeLiveSession ab broadcast ke saath stream resource bhi
+//     delete karta hai.
+//   - isVideoOwnedByUserChannel(): purani video live karne se pehle check
+//     ki wo video isi user ke connected channel ki hai (dusre ki video
+//     stream na ho sake).
+//   - describeYouTubeError(): route ke liye ek jagah se error -> status/code/message.
 
 const axios = require('axios');
 const { refreshAccessToken, isInvalidGrantError } = require('./youtube');
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
+const YOUTUBE_TIMEOUT_MS = 20000;
+
+function ytConfig(accessToken, extra = {}) {
+  return {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    timeout: YOUTUBE_TIMEOUT_MS,
+    ...extra
+  };
+}
+
+// YouTube limits: title max 100 chars, description max 5000 chars.
+function cleanTitle(title, fallback) {
+  const t = typeof title === 'string' ? title.trim() : '';
+  return (t || fallback).slice(0, 100);
+}
+
+function cleanDescription(description) {
+  return (typeof description === 'string' ? description : '').slice(0, 5000);
+}
 
 /**
  * User ka access token check karta hai — agar expire ho chuka hai to
@@ -54,8 +84,8 @@ async function createLiveBroadcast(accessToken, { title, description }) {
     `${YOUTUBE_API_BASE}/liveBroadcasts?part=snippet,status,contentDetails`,
     {
       snippet: {
-        title: title || 'Live Stream via TubePilot',
-        description: description || '',
+        title: cleanTitle(title, 'Live Stream via TubePilot'),
+        description: cleanDescription(description),
         scheduledStartTime: new Date().toISOString()
       },
       status: {
@@ -69,7 +99,7 @@ async function createLiveBroadcast(accessToken, { title, description }) {
         latencyPreference: 'normal'
       }
     },
-    { headers: { Authorization: `Bearer ${accessToken}` } }
+    ytConfig(accessToken)
   );
 
   return response.data; // { id, snippet, status, contentDetails, ... }
@@ -79,7 +109,7 @@ async function createLiveStream(accessToken, title) {
   const response = await axios.post(
     `${YOUTUBE_API_BASE}/liveStreams?part=snippet,cdn,contentDetails`,
     {
-      snippet: { title: title || 'TubePilot Live Stream' },
+      snippet: { title: cleanTitle(title, 'TubePilot Live Stream') },
       cdn: {
         frameRate: 'variable',
         ingestionType: 'rtmp',
@@ -87,7 +117,7 @@ async function createLiveStream(accessToken, title) {
       },
       contentDetails: { isReusable: false }
     },
-    { headers: { Authorization: `Bearer ${accessToken}` } }
+    ytConfig(accessToken)
   );
 
   return response.data; // { id, cdn: { ingestionInfo: { streamName, ingestionAddress } } }
@@ -97,7 +127,7 @@ async function bindBroadcastToStream(accessToken, broadcastId, streamId) {
   const response = await axios.post(
     `${YOUTUBE_API_BASE}/liveBroadcasts/bind?id=${broadcastId}&streamId=${streamId}&part=id,contentDetails`,
     {},
-    { headers: { Authorization: `Bearer ${accessToken}` } }
+    ytConfig(accessToken)
   );
   return response.data;
 }
@@ -108,7 +138,7 @@ async function transitionBroadcast(accessToken, broadcastId, broadcastStatus) {
     const response = await axios.post(
       `${YOUTUBE_API_BASE}/liveBroadcasts/transition?broadcastStatus=${broadcastStatus}&id=${broadcastId}&part=id,status`,
       {},
-      { headers: { Authorization: `Bearer ${accessToken}` } }
+      ytConfig(accessToken)
     );
     return response.data;
   } catch (err) {
@@ -119,9 +149,32 @@ async function transitionBroadcast(accessToken, broadcastId, broadcastStatus) {
   }
 }
 
+// Broadcast aur/ya stream resource ko delete karta hai. Kabhi throw nahi
+// karta — cleanup ki wajah se asli error dab nahi jana chahiye.
+async function deleteYouTubeResources(accessToken, { broadcastId, streamId } = {}) {
+  if (broadcastId) {
+    try {
+      await axios.delete(`${YOUTUBE_API_BASE}/liveBroadcasts?id=${broadcastId}`, ytConfig(accessToken));
+      console.log(`[YouTube Live] Broadcast ${broadcastId} delete kar diya.`);
+    } catch (err) {
+      console.error('⚠️ [YouTube Live] Broadcast delete failed (ignored):', err.response?.data?.error?.message || err.message);
+    }
+  }
+  if (streamId) {
+    try {
+      await axios.delete(`${YOUTUBE_API_BASE}/liveStreams?id=${streamId}`, ytConfig(accessToken));
+      console.log(`[YouTube Live] Stream resource ${streamId} delete kar diya.`);
+    } catch (err) {
+      console.error('⚠️ [YouTube Live] Stream delete failed (ignored):', err.response?.data?.error?.message || err.message);
+    }
+  }
+}
+
 /**
  * MAIN FUNCTION — Live streaming shuru karne ke liye ye ek hi function
  * call karo. Poora broadcast + stream + bind process khud handle karta hai.
+ * Beech mein kahin fail hua to jo ban chuka hai use delete karke error
+ * upar throw karta hai.
  *
  * @param {object} user - Mongoose User document (req.user)
  * @param {object} options - { title, description }
@@ -130,14 +183,22 @@ async function transitionBroadcast(accessToken, broadcastId, broadcastStatus) {
 async function startYouTubeLiveSession(user, { title, description } = {}) {
   const accessToken = await ensureFreshYouTubeToken(user);
 
-  console.log(`[YouTube Live] Broadcast bana rahe hain — user ${user._id}, title="${title}"`);
-  const broadcast = await createLiveBroadcast(accessToken, { title, description });
+  let broadcast = null;
+  let stream = null;
 
-  console.log(`[YouTube Live] Stream bana rahe hain — broadcastId=${broadcast.id}`);
-  const stream = await createLiveStream(accessToken, title);
+  try {
+    console.log(`[YouTube Live] Broadcast bana rahe hain — user ${user._id}, title="${title}"`);
+    broadcast = await createLiveBroadcast(accessToken, { title, description });
 
-  console.log(`[YouTube Live] Bind kar rahe hain — streamId=${stream.id}`);
-  await bindBroadcastToStream(accessToken, broadcast.id, stream.id);
+    console.log(`[YouTube Live] Stream bana rahe hain — broadcastId=${broadcast.id}`);
+    stream = await createLiveStream(accessToken, title);
+
+    console.log(`[YouTube Live] Bind kar rahe hain — streamId=${stream.id}`);
+    await bindBroadcastToStream(accessToken, broadcast.id, stream.id);
+  } catch (err) {
+    await deleteYouTubeResources(accessToken, { broadcastId: broadcast?.id, streamId: stream?.id });
+    throw err;
+  }
 
   const ingestionInfo = stream.cdn.ingestionInfo;
 
@@ -172,23 +233,71 @@ async function endYouTubeLiveSession(user, broadcastId) {
  * Jo broadcast kabhi live gaya hi nahi (jaise EC2 connect fail hone par),
  * use "complete" nahi kar sakte — YouTube sirf live broadcast ko complete
  * hone deta hai. Aise broadcast ko DELETE karna padta hai, warna wo
- * YouTube Studio mein "upcoming" bankar pada rehta hai.
+ * YouTube Studio mein "upcoming" bankar pada rehta hai. Ab stream resource
+ * (youtubeStreamId) bhi delete hota hai agar diya gaya ho.
  */
-async function discardYouTubeLiveSession(user, broadcastId) {
-  if (!broadcastId) return;
+async function discardYouTubeLiveSession(user, broadcastId, youtubeStreamId) {
+  if (!broadcastId && !youtubeStreamId) return;
   try {
     const accessToken = await ensureFreshYouTubeToken(user);
-    await axios.delete(`${YOUTUBE_API_BASE}/liveBroadcasts?id=${broadcastId}`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
-    console.log(`[YouTube Live] Unused broadcast ${broadcastId} delete kar diya.`);
+    await deleteYouTubeResources(accessToken, { broadcastId, streamId: youtubeStreamId });
   } catch (err) {
-    console.error(`⚠️ [YouTube Live] Broadcast delete failed (ignored):`, err.response?.data?.error?.message || err.message);
+    console.error('⚠️ [YouTube Live] Discard failed (ignored):', err.message);
   }
+}
+
+/**
+ * Purani video live karne se pehle: kya ye videoId user ke apne connected
+ * YouTube channel ki hai? (Sirf apni video hi stream ho sakti hai.)
+ * Cost: 2 chhoti API calls (1 quota unit each).
+ */
+async function isVideoOwnedByUserChannel(user, videoId) {
+  const accessToken = await ensureFreshYouTubeToken(user);
+
+  const [mine, video] = await Promise.all([
+    axios.get(`${YOUTUBE_API_BASE}/channels`, ytConfig(accessToken, { params: { part: 'id', mine: true } })),
+    axios.get(`${YOUTUBE_API_BASE}/videos`, ytConfig(accessToken, { params: { part: 'snippet', id: videoId } }))
+  ]);
+
+  const myChannelId = mine.data?.items?.[0]?.id;
+  const videoChannelId = video.data?.items?.[0]?.snippet?.channelId;
+  return Boolean(myChannelId) && myChannelId === videoChannelId;
+}
+
+/**
+ * Kisi bhi YouTube-related error ko route ke liye { status, code, message }
+ * mein badalta hai.
+ */
+function describeYouTubeError(err) {
+  if (err.code === 'YOUTUBE_NOT_CONNECTED' || err.code === 'YOUTUBE_REAUTH_REQUIRED') {
+    return { status: 400, code: err.code, message: err.message };
+  }
+
+  const reason = err.response?.data?.error?.errors?.[0]?.reason;
+
+  if (reason === 'liveStreamingNotEnabled') {
+    return {
+      status: 400,
+      code: 'YOUTUBE_LIVE_NOT_ENABLED',
+      message: 'Aapke YouTube channel par live streaming enabled nahi hai. YouTube Studio mein "Go Live" kholkar phone verify karein — enable hone mein 24 ghante lag sakte hain.'
+    };
+  }
+
+  if (reason === 'quotaExceeded' || reason === 'rateLimitExceeded' || reason === 'userRateLimitExceeded') {
+    return { status: 429, code: 'YOUTUBE_RATE_LIMITED', message: 'YouTube abhi busy hai. Thodi der baad try karein.' };
+  }
+
+  if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+    return { status: 504, code: 'YOUTUBE_TIMEOUT', message: 'YouTube se response nahi aaya. Thodi der baad try karein.' };
+  }
+
+  return { status: 500, code: 'YOUTUBE_LIVE_ERROR', message: 'YouTube live session banane mein error aayi.' };
 }
 
 module.exports = {
   startYouTubeLiveSession,
   endYouTubeLiveSession,
-  discardYouTubeLiveSession
+  discardYouTubeLiveSession,
+  isVideoOwnedByUserChannel,
+  describeYouTubeError
 };
