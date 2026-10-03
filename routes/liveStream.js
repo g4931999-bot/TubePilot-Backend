@@ -14,6 +14,7 @@ const {
   endYouTubeLiveSession,
   discardYouTubeLiveSession,
   isVideoOwnedByUserChannel,
+  getYouTubeStreamStatus,
   describeYouTubeError
 } = require('../utils/youtubeLive');
 
@@ -696,6 +697,7 @@ router.post('/start-camera', protect, async (req, res) => {
       secondsAllowed: planCheck.secondsRemaining,
       watchUrl: youtubeSession.watchUrl,
       rtmpUrl: youtubeSession.ingestionAddress,
+      rtmpsUrl: youtubeSession.rtmpsAddress || null,
       streamKey: youtubeSession.streamKey,
       startedAt: new Date(startedAtMs).toISOString(),
       ...(after ? limitFields(after) : {})
@@ -852,6 +854,12 @@ router.get('/status/:streamId', protect, async (req, res) => {
 
     if (!record || record.userId !== req.user._id.toString()) {
       return res.status(404).json({ success: false, message: 'Stream nahi mili.' });
+    }
+
+    // Camera live mein EC2 hota hi nahi — YouTube se poocho ki data aa raha hai ya nahi.
+    if (record.kind === 'camera') {
+      const yt = await getYouTubeStreamStatus(req.user, record.youtubeStreamId);
+      return res.json({ success: true, active: yt.streamStatus === 'active', ...yt });
     }
 
     const ec2Response = await ec2Request('get', `/status/${streamId}`);
