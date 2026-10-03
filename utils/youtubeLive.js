@@ -96,6 +96,7 @@ async function createLiveBroadcast(accessToken, { title, description }) {
         enableAutoStart: true, // RTMP data aate hi automatically "live" ho jayega — koi extra transition call nahi chahiye
         enableAutoStop: true,  // agar RTMP data rukk jaye, YouTube khud broadcast end kar dega (safety net)
         enableDvr: true,
+        enableEmbed: true,     // app ke andar YouTube preview player chale, isliye embed allowed
         latencyPreference: 'normal'
       }
     },
@@ -213,19 +214,49 @@ async function startYouTubeLiveSession(user, { title, description } = {}) {
   };
 }
 
+async function getBroadcastLifecycle(accessToken, broadcastId) {
+  try {
+    const response = await axios.get(
+      `${YOUTUBE_API_BASE}/liveBroadcasts`,
+      ytConfig(accessToken, { params: { part: 'status', id: broadcastId } })
+    );
+    return response.data?.items?.[0]?.status?.lifeCycleStatus || null;
+  } catch (err) {
+    console.error('⚠️ [YouTube Live] lifecycle check failed (ignored):', err.response?.data?.error?.message || err.message);
+    return null;
+  }
+}
+
 /**
- * Live session ko YouTube ki taraf se bhi properly "complete" karta hai
- * (sirf FFmpeg band karna kaafi nahi — broadcast bhi close karna chahiye
- * warna YouTube pe "stuck live" dikh sakta hai).
+ * Live session ko YouTube ki taraf se properly band karta hai.
+ *   - Broadcast kabhi live hi nahi hua (created/ready) -> delete karta hai
+ *     aur { neverLive: true } deta hai (route us live ka slot/hours wapas karta hai).
+ *   - Live tha -> "complete" karta hai (sirf FFmpeg/camera band karna kaafi nahi,
+ *     warna YouTube pe "stuck live" dikh sakta hai).
+ * Kabhi throw nahi karta.
  */
-async function endYouTubeLiveSession(user, broadcastId) {
-  if (!broadcastId) return;
+async function endYouTubeLiveSession(user, broadcastId, youtubeStreamId) {
+  if (!broadcastId) return { neverLive: false };
   try {
     const accessToken = await ensureFreshYouTubeToken(user);
+    const lifecycle = await getBroadcastLifecycle(accessToken, broadcastId);
+
+    if (lifecycle === 'created' || lifecycle === 'ready') {
+      console.log(`[YouTube Live] Broadcast ${broadcastId} kabhi live nahi hua (${lifecycle}) — delete kar rahe hain.`);
+      await deleteYouTubeResources(accessToken, { broadcastId, streamId: youtubeStreamId });
+      return { neverLive: true };
+    }
+
+    if (lifecycle === 'complete' || lifecycle === 'revoked') {
+      return { neverLive: false }; // already khatam (autoStop ne kar diya)
+    }
+
     await transitionBroadcast(accessToken, broadcastId, 'complete');
     console.log(`[YouTube Live] Broadcast ${broadcastId} complete kar diya.`);
+    return { neverLive: false };
   } catch (err) {
-    console.error(`⚠️ [YouTube Live] End session failed (ignored, stream EC2 side to band ho hi chuka hai):`, err.message);
+    console.error('⚠️ [YouTube Live] End session failed (ignored):', err.message);
+    return { neverLive: false };
   }
 }
 
