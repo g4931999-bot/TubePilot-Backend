@@ -208,6 +208,7 @@ async function startYouTubeLiveSession(user, { title, description } = {}) {
   return {
     streamKey: ingestionInfo.streamName,
     ingestionAddress: ingestionInfo.ingestionAddress, // usually rtmp://a.rtmp.youtube.com/live2
+    rtmpsAddress: ingestionInfo.rtmpsIngestionAddress || null, // usually rtmps://a.rtmps.youtube.com:443/live2
     broadcastId: broadcast.id,
     youtubeStreamId: stream.id,
     watchUrl: `https://youtube.com/watch?v=${broadcast.id}`
@@ -278,6 +279,24 @@ async function discardYouTubeLiveSession(user, broadcastId, youtubeStreamId) {
 }
 
 /**
+ * YouTube ki taraf se is stream ki sthiti: kya YouTube ko data mil raha hai?
+ * streamStatus: 'active' = data aa raha hai, 'inactive'/'ready' = nahi aa raha.
+ * Camera live debug/confirmation ke liye (1 quota unit).
+ */
+async function getYouTubeStreamStatus(user, youtubeStreamId) {
+  const accessToken = await ensureFreshYouTubeToken(user);
+  const response = await axios.get(
+    `${YOUTUBE_API_BASE}/liveStreams`,
+    ytConfig(accessToken, { params: { part: 'status', id: youtubeStreamId } })
+  );
+  const status = response.data?.items?.[0]?.status || {};
+  return {
+    streamStatus: status.streamStatus || null,
+    health: status.healthStatus?.status || null
+  };
+}
+
+/**
  * Purani video live karne se pehle: kya ye videoId user ke apne connected
  * YouTube channel ki hai? (Sirf apni video hi stream ho sakti hai.)
  * Cost: 2 chhoti API calls (1 quota unit each).
@@ -330,5 +349,6 @@ module.exports = {
   endYouTubeLiveSession,
   discardYouTubeLiveSession,
   isVideoOwnedByUserChannel,
+  getYouTubeStreamStatus,
   describeYouTubeError
 };
