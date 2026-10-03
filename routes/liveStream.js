@@ -66,7 +66,7 @@ const liveStreamLogSchema = new mongoose.Schema({
   youtubeStreamId: { type: String, default: null },
   watchUrl: { type: String, default: null },
   title: { type: String, default: '' },
-  source: { type: String, enum: ['upload', 'library'], default: 'upload' }
+  source: { type: String, enum: ['upload', 'library', 'camera'], default: 'upload' }
 });
 liveStreamLogSchema.index({ userId: 1, startedAt: -1 });
 const LiveStreamLog = mongoose.models.LiveStreamLog || mongoose.model('LiveStreamLog', liveStreamLogSchema);
@@ -150,6 +150,7 @@ async function getLimitState(userId, now = Date.now()) {
     activeStream: liveDoc
       ? {
           streamId: liveDoc.streamId,
+          source: liveDoc.source || 'upload',
           startedAt: liveDoc.startedAt.toISOString(),
           secondsAllowed: liveDoc.secondsAllowed,
           secondsRemaining: Math.max(0, Math.round((liveDoc.expiresAt.getTime() - now) / 1000)),
@@ -563,6 +564,8 @@ router.post('/start', protect, async (req, res) => {
       expiresAt: expiresAtMs,
       isFreeTrial: !!planCheck.isFreeTrial,
       broadcastId: youtubeSession.broadcastId,
+      youtubeStreamId: youtubeSession.youtubeStreamId,
+      kind: 'ec2',
       timer: null
     });
 
@@ -595,6 +598,117 @@ router.post('/start', protect, async (req, res) => {
 });
 
 // -----------------------------------------------------------------------
+// POST /api/live-stream/start-camera
+// Phone ka camera seedha YouTube ko RTMP bhejta hai (EC2 beech mein NAHI aata).
+// Wahi rules lagte hain: 1 at a time, 1 ghanta gap, 24 ghante mein max 3, plan hours.
+// Response mein rtmpUrl + streamKey hai — app inhi se camera stream bhejti hai.
+// Body: { title, description }
+// -----------------------------------------------------------------------
+router.post('/start-camera', protect, async (req, res) => {
+  const userKey = req.user._id.toString();
+  let lockTaken = false;
+
+  try {
+    const { title, description } = req.body || {};
+
+    if (startingUsers.has(userKey)) {
+      return res.status(429).json({
+        success: false,
+        code: 'LIVE_START_IN_PROGRESS',
+        message: 'Aapki pichli request abhi process ho rahi hai. Thoda ruk kar dekhein.'
+      });
+    }
+    startingUsers.add(userKey);
+    lockTaken = true;
+
+    const limitState = await getLimitState(req.user._id);
+    if (!limitState.canStart) {
+      return sendLimitBlocked(res, limitState);
+    }
+
+    const planCheck = evaluateUserPlan(req.user);
+    if (!planCheck.allowed) {
+      return res.status(403).json({ success: false, message: planCheck.reason });
+    }
+
+    const cleanTitle = typeof title === 'string' ? title.trim().slice(0, 100) : '';
+
+    let youtubeSession;
+    try {
+      youtubeSession = await startYouTubeLiveSession(req.user, { title: cleanTitle, description });
+    } catch (err) {
+      const info = describeYouTubeError(err);
+      if (info.status === 500) {
+        console.error('❌ [liveStream/start-camera] YouTube session banane mein error:', err.response?.data || err.message);
+      }
+      return res.status(info.status).json({ success: false, code: info.code, message: info.message });
+    }
+
+    const streamId = `${req.user._id}_${crypto.randomBytes(4).toString('hex')}`;
+    const startedAtMs = Date.now();
+    const expiresAtMs = startedAtMs + planCheck.secondsRemaining * 1000;
+
+    try {
+      await LiveStreamLog.create({
+        userId: req.user._id,
+        streamId,
+        startedAt: new Date(startedAtMs),
+        expiresAt: new Date(expiresAtMs),
+        status: 'live',
+        isFreeTrial: !!planCheck.isFreeTrial,
+        secondsAllowed: planCheck.secondsRemaining,
+        broadcastId: youtubeSession.broadcastId,
+        youtubeStreamId: youtubeSession.youtubeStreamId,
+        watchUrl: youtubeSession.watchUrl,
+        title: cleanTitle,
+        source: 'camera'
+      });
+    } catch (dbErr) {
+      console.error('❌ [liveStream/start-camera] Log save failed:', dbErr.message);
+      await discardYouTubeLiveSession(req.user, youtubeSession.broadcastId, youtubeSession.youtubeStreamId);
+      return res.status(500).json({ success: false, message: 'Camera live start karne mein error aayi.' });
+    }
+
+    activeStreams.set(streamId, {
+      userId: userKey,
+      startedAt: startedAtMs,
+      expiresAt: expiresAtMs,
+      isFreeTrial: !!planCheck.isFreeTrial,
+      broadcastId: youtubeSession.broadcastId,
+      youtubeStreamId: youtubeSession.youtubeStreamId,
+      kind: 'camera',
+      timer: null
+    });
+    armAutoStop(streamId, planCheck.secondsRemaining * 1000);
+
+    let after = null;
+    try {
+      after = await getLimitState(req.user._id);
+    } catch (_) {
+      after = null;
+    }
+
+    return res.json({
+      success: true,
+      message: planCheck.isFreeTrial ? 'Free trial camera live ready (5 minute).' : 'Camera live ready.',
+      streamId,
+      isFreeTrial: !!planCheck.isFreeTrial,
+      secondsAllowed: planCheck.secondsRemaining,
+      watchUrl: youtubeSession.watchUrl,
+      rtmpUrl: youtubeSession.ingestionAddress,
+      streamKey: youtubeSession.streamKey,
+      startedAt: new Date(startedAtMs).toISOString(),
+      ...(after ? limitFields(after) : {})
+    });
+  } catch (err) {
+    console.error('❌ [liveStream/start-camera]', err.message);
+    return res.status(500).json({ success: false, message: 'Camera live start karne mein error aayi.' });
+  } finally {
+    if (lockTaken) startingUsers.delete(userKey);
+  }
+});
+
+// -----------------------------------------------------------------------
 // Internal: stream ko band karta hai aur (agar free trial nahi tha) User
 // ke hoursUsedSeconds mein actual elapsed time add karta hai.
 // -----------------------------------------------------------------------
@@ -612,18 +726,25 @@ async function stopStreamInternal(streamId, record) {
   activeStreams.delete(streamId);
   if (record.timer) clearTimeout(record.timer);
 
-  try {
-    await ec2Request('post', '/stop', { streamId });
-  } catch (err) {
-    console.error(`❌ [Stop] EC2 stop call failed for ${streamId}:`, err.code || err.message);
+  // Camera live mein FFmpeg/EC2 hota hi nahi — phone seedha YouTube ko bhejta hai.
+  if (record.kind !== 'camera') {
+    try {
+      await ec2Request('post', '/stop', { streamId });
+    } catch (err) {
+      console.error(`❌ [Stop] EC2 stop call failed for ${streamId}:`, err.code || err.message);
+    }
   }
 
-  // YouTube ki taraf se bhi broadcast properly "complete" karo (sirf FFmpeg
-  // band karna kaafi nahi, warna YouTube pe "stuck live" dikh sakta hai)
+  // YouTube ki taraf se broadcast band karo. Agar wo kabhi live hi nahi hua
+  // (jaise camera connect nahi hua) to delete hota hai aur neverLive=true aata hai.
+  let neverLive = false;
   if (record.broadcastId) {
     try {
       const user = await User.findById(record.userId);
-      if (user) await endYouTubeLiveSession(user, record.broadcastId);
+      if (user) {
+        const result = await endYouTubeLiveSession(user, record.broadcastId, record.youtubeStreamId);
+        neverLive = Boolean(result && result.neverLive);
+      }
     } catch (err) {
       console.error(`❌ [Stop] YouTube broadcast end karne mein error:`, err.message);
     }
@@ -631,10 +752,12 @@ async function stopStreamInternal(streamId, record) {
 
   // Allotted time se zyada kabhi count nahi hoga (server restart ke baad late stop par bhi).
   const endMs = Math.min(Date.now(), record.expiresAt || Date.now());
-  const elapsedSeconds = Math.max(0, Math.floor((endMs - record.startedAt) / 1000));
+  const elapsedSeconds = neverLive ? 0 : Math.max(0, Math.floor((endMs - record.startedAt) / 1000));
 
   try {
-    if (record.isFreeTrial) {
+    if (neverLive) {
+      // Stream hui hi nahi — free trial / plan hours kharch nahi honge.
+    } else if (record.isFreeTrial) {
       await User.findByIdAndUpdate(record.userId, { $set: { 'liveStream.freeTrialUsed': true } });
     } else {
       await User.findByIdAndUpdate(record.userId, { $inc: { 'liveStream.hoursUsedSeconds': elapsedSeconds } });
@@ -643,9 +766,15 @@ async function stopStreamInternal(streamId, record) {
     console.error(`❌ [Stop] User hours update failed for ${streamId}:`, err.message);
   }
 
-  // Log "ended" mark karo — startedAt wahi rehta hai, isliye 1h / 24h ka count nahi badalta.
+  // Log: live hui to "ended" (startedAt wahi rehta hai, 1h / 24h count nahi badalta).
+  // Kabhi live nahi hui to log hata do — us try ka slot wapas mil jata hai.
   try {
-    await LiveStreamLog.updateOne({ streamId }, { $set: { status: 'ended', endedAt: new Date() } });
+    if (neverLive) {
+      await LiveStreamLog.deleteOne({ streamId });
+      console.log(`[Stream Cancelled] ${streamId} — kabhi live nahi hui, slot wapas.`);
+    } else {
+      await LiveStreamLog.updateOne({ streamId }, { $set: { status: 'ended', endedAt: new Date() } });
+    }
   } catch (err) {
     console.error(`❌ [Stop] Log update failed for ${streamId}:`, err.message);
   }
@@ -668,6 +797,8 @@ async function recoverOrphanStreams() {
         expiresAt: log.expiresAt.getTime(),
         isFreeTrial: !!log.isFreeTrial,
         broadcastId: log.broadcastId,
+        youtubeStreamId: log.youtubeStreamId,
+        kind: log.source === 'camera' ? 'camera' : 'ec2',
         timer: null
       };
       const remainingMs = record.expiresAt - Date.now();
