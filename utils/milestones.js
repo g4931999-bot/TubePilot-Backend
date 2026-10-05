@@ -29,6 +29,24 @@ const highest = (list, current, last) => {
   return hit.length ? hit[hit.length - 1] : null;
 };
 
+// NEW: best-effort channel photo URL. Tries stats first, then the saved channel on the user.
+// If your field has another name, add it to the candidates list below.
+const pickThumbnail = (user, stats) => {
+  const c = (user && user.youtubeChannel) || {};
+  const candidates = [
+    stats && stats.channelThumbnail,
+    stats && stats.thumbnail,
+    c.thumbnail,
+    c.thumbnailUrl,
+    c.thumbnails && c.thumbnails.default && c.thumbnails.default.url,
+    c.avatar,
+    c.profileImage,
+    c.picture
+  ];
+  const url = candidates.find((u) => typeof u === 'string' && /^https?:\/\//.test(u));
+  return url || '';
+};
+
 const getFreshToken = async (user) => {
   const ch = user.youtubeChannel;
   const expired = !ch.tokenExpiryDate || Date.now() > ch.tokenExpiryDate - 60000;
@@ -47,20 +65,51 @@ const describe = (m) => {
     : { title: `🔥 ${v} Views!`, body: `Congratulations! Your latest video just crossed ${v} views.` };
 };
 
+// Black + gold achievement email (matches the in-app card).
+// Email-safe: tables + inline styles, solid bgcolor fallbacks (no reliance on gradients).
 const buildEmail = (m) => {
   const v = fmt(m.value);
+  const isSubs = m.type === 'subscribers';
   const { body } = describe(m);
-  const line = m.type === 'subscribers' ? `You reached ${v} subscribers` : `Your latest video hit ${v} views`;
-  return `<div style="background:#f7f0f5;padding:24px;font-family:Arial,Helvetica,sans-serif">
-  <div style="max-width:420px;margin:auto;background-color:#4B1D3F;background-image:linear-gradient(135deg,#2A0F22,#4B1D3F);border-radius:24px;padding:32px 24px;text-align:center;color:#ffffff">
-    <div style="font-size:20px;font-weight:800;letter-spacing:.5px">TubePilot</div>
-    <div style="margin:24px auto;width:140px;height:140px;border-radius:70px;border:6px solid #D4A017;line-height:128px;font-size:44px;font-weight:800">${esc(v)}</div>
-    <div style="font-size:22px;font-weight:700">Congratulations!</div>
-    <div style="font-size:16px;margin-top:8px">${esc(line)}</div>
-    ${m.type === 'views' && m.videoTitle ? `<div style="font-size:13px;color:#e3cbda;margin-top:8px">${esc(m.videoTitle)}</div>` : ''}
-    <div style="font-size:13px;color:#e3cbda;margin-top:16px">${esc(m.channelTitle)}</div>
-  </div>
-  <p style="text-align:center;color:#7A3A67;font-size:12px;margin-top:16px">${esc(body)}<br>Open the TubePilot app to download and share your achievement card.</p>
+  const channel = m.channelTitle || 'Your channel';
+  const heading = isSubs ? 'Subscriber Milestone' : 'Views Milestone';
+  const lead = isSubs ? 'You reached ' : 'Your latest video hit ';
+  const tail = isSubs ? ' subscribers' : ' views';
+  const sub = isSubs ? 'Congratulations! Your community is growing.' : 'Congratulations on this milestone!';
+  const hasThumb = /^https?:\/\//.test(m.channelThumbnail || '');
+  const avatar = hasThumb
+    ? `<img src="${esc(m.channelThumbnail)}" width="22" height="22" alt="" style="width:22px;height:22px;border-radius:11px;vertical-align:middle;margin-right:8px;border:1px solid #F2B531">`
+    : '';
+  const ytIcon = `<span style="display:inline-block;width:22px;height:16px;line-height:16px;border-radius:4px;background:#FF0000;color:#ffffff;font-size:9px;text-align:center;vertical-align:middle;margin-right:8px">&#9654;</span>`;
+
+  return `<div style="background:#000000;padding:24px 12px;font-family:Arial,Helvetica,sans-serif">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:420px;margin:auto">
+    <tr><td align="center" bgcolor="#0C0C10" style="background-color:#0C0C10;border-radius:28px;padding:26px 18px;border:1px solid #26262E">
+
+      <div style="font-size:19px;font-weight:700;color:#ffffff;letter-spacing:.2px">&#127942; ${esc(heading)} &#127942;</div>
+      <div style="font-size:12.5px;color:#B4B0C4;margin-top:10px">${avatar}<span style="vertical-align:middle">${esc(channel)}</span></div>
+
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:18px">
+        <tr><td align="center" bgcolor="#0F0F14" style="background-color:#0F0F14;border-radius:24px;padding:22px 16px;border:1px solid #26262E">
+
+          <div style="font-size:22px;font-weight:800;letter-spacing:.3px"><span style="color:#ffffff">Tube</span><span style="color:#F2B531">Pilot</span></div>
+
+          <div style="margin:22px auto 20px;width:140px;height:140px;border-radius:70px;border:6px solid #F2B531;background:#17121F;text-align:center;line-height:128px;font-size:44px;font-weight:800;color:#ffffff;box-shadow:0 0 28px rgba(242,181,49,.35)">${esc(v)}</div>
+
+          <div style="font-size:22px;font-weight:800;color:#ffffff;line-height:1.25">${lead}<span style="color:#F2B531;font-style:italic">${esc(v)}</span>${tail}</div>
+          <div style="font-size:14px;color:#B4B0C4;margin-top:8px">${esc(sub)}</div>
+          ${!isSubs && m.videoTitle ? `<div style="font-size:12px;color:#7E7A92;margin-top:6px">${esc(m.videoTitle)}</div>` : ''}
+
+          <div style="margin-top:18px">
+            <span style="display:inline-block;background:#1B1B22;border:1px solid #2C2C35;border-radius:999px;padding:8px 16px;font-size:13.5px;font-weight:600;color:#ffffff">${ytIcon}<span style="vertical-align:middle">${esc(channel)}</span></span>
+          </div>
+
+        </td></tr>
+      </table>
+
+    </td></tr>
+  </table>
+  <p style="text-align:center;color:#8A869C;font-size:12px;margin:16px auto 0;max-width:420px;line-height:1.5">${esc(body)}<br>Open the TubePilot app to download and share your achievement card.</p>
 </div>`;
 };
 
@@ -137,7 +186,8 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
     value: pick === 'subscribers' ? subValue : viewValue,
     videoId: pick === 'views' ? lv.videoId : '',
     videoTitle: pick === 'views' ? lv.title : '',
-    channelTitle: stats.channelTitle
+    channelTitle: stats.channelTitle,
+    channelThumbnail: pickThumbnail(user, stats) // NEW
   });
 
   tracker.lastType = pick;
