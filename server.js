@@ -10,7 +10,8 @@ const {
   startPublishScheduler,
   startRetryScheduler,
   startFreeUploadReset,
-  startDriveAutoUploadScheduler
+  startDriveAutoUploadScheduler,
+  startMilestoneScheduler
 } = require('./cron/scheduler');
 
 // Core Routes Import
@@ -32,6 +33,7 @@ const ratingsRoutes = require('./routes/ratings');
 const seedAdminRoute = require('./routes/seedAdmin');
 const uploadsRoutes = require('./routes/uploads');
 const oauthRoutes = require('./routes/oauth');
+const milestoneRoutes = require('./routes/milestones');
 
 const app = express();
 
@@ -181,6 +183,7 @@ app.use('/api/ai', aiRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ratings', ratingsRoutes);
+app.use('/api/milestones', milestoneRoutes);
 app.use('/api/seed-admin', seedAdminRoute);
 
 app.use('/api/uploads', uploadsRoutes);
@@ -226,6 +229,7 @@ const startServer = async () => {
       startRetryScheduler();
       startFreeUploadReset();
       startDriveAutoUploadScheduler();
+      startMilestoneScheduler();
     });
   } catch (error) {
     console.error('❌ Fatal Server Startup Error:', error.message);
