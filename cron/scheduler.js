@@ -16,6 +16,9 @@ const {
   daysBetweenDateStrings
 } = require('../utils/dateHelpers');
 
+const MilestoneTracker = require('../models/MilestoneTracker');
+const { generateMilestoneForUser } = require('../utils/milestones');
+
 const MAX_RETRIES = 3;
 
 const getVideoFileStream = async (video) => {
@@ -687,7 +690,32 @@ const startDriveAutoUploadScheduler = () => {
   console.log('📁 Drive auto-upload scheduler is running (LIVE-mode users checked every minute; SCHEDULED-mode users at fixed 06:00 IST + 06:05 inactivity check)');
 };
 
+// -----------------------------------------------------------------------
+// ⚠️ NEW (Milestone feature): daily 10:00 IST check. Only users whose next
+// card is due (every 15 days) are processed; one card per user per cycle.
+// -----------------------------------------------------------------------
+const startMilestoneScheduler = () => {
+  cron.schedule(process.env.MILESTONE_CRON || '0 10 * * *', async () => {
+    try {
+      const due = await MilestoneTracker.find({ nextDueAt: { $lte: new Date() } }).limit(300);
+      for (const t of due) {
+        try {
+          const user = await User.findById(t.user);
+          if (!user || !user.youtubeChannel) continue;
+          await generateMilestoneForUser(user);
+        } catch (err) {
+          console.error(`❌ [Milestone] user ${t.user}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error('❌ [Milestone] scheduler tick error:', err.message);
+    }
+  }, { timezone: 'Asia/Kolkata' });
+  console.log('🏆 Milestone scheduler is running (daily 10:00 IST)');
+};
+
 module.exports = {
+  startMilestoneScheduler,
   startPublishScheduler,
   startRetryScheduler,
   startFreeUploadReset,
