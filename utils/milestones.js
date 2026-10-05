@@ -109,7 +109,9 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
     tracker.lastSubMilestone = 0;
     tracker.videoMilestones = new Map();
     tracker.lastType = '';
+    tracker.initialCheckDone = false;
   }
+  const isFirstCheck = !tracker.initialCheckDone;
 
   const subValue = stats.subscribers != null ? highest(MILESTONES.subscribers, stats.subscribers, tracker.lastSubMilestone) : null;
   const lv = stats.latestVideo;
@@ -118,8 +120,14 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
   // Alternate: views first, then subscribers, then views...
   const order = tracker.lastType === 'views' ? ['subscribers', 'views'] : ['views', 'subscribers'];
   const pick = order.find((t) => (t === 'subscribers' ? subValue : viewValue));
+  tracker.initialCheckDone = true;
+
   if (!pick) {
-    await tracker.save(); // nothing new; stays due, re-checked on the next daily run
+    // First connect with no milestone yet (e.g. only 10-20 subscribers): no popup now,
+    // and the 15-day cycle starts from today. On later checks, nothing new stays "due"
+    // and is re-checked daily until a milestone is actually reached.
+    if (isFirstCheck) tracker.nextDueAt = new Date(Date.now() + CYCLE_DAYS * DAY_MS);
+    await tracker.save();
     return null;
   }
 
