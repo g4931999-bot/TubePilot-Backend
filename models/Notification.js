@@ -7,7 +7,7 @@ const NotificationSchema = new mongoose.Schema({
     enum: [
       'payment_approved', 'payment_rejected', 'upload_completed', 'upload_failed',
       'schedule_started', 'schedule_finished', 'subscription_expiring', 'free_upload_reset',
-      'gift_code_redeemed'
+      'gift_code_redeemed', 'milestone'
     ],
     required: true
   },
