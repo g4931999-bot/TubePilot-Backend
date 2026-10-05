@@ -151,6 +151,33 @@ const deleteVideoFromYoutube = async ({ accessToken, refreshToken, videoId }) =>
   await youtube.videos.delete({ id: videoId });
 };
 
+// ⚠️ NEW (Milestone feature): channel subscribers + latest video views, in 3 light list calls.
+const getMilestoneStats = async (accessToken) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+
+  const chRes = await youtube.channels.list({ part: 'snippet,statistics,contentDetails', mine: true });
+  const ch = chRes.data.items?.[0];
+  if (!ch) return null;
+
+  const st = ch.statistics || {};
+  const subscribers = st.hiddenSubscriberCount ? null : Number(st.subscriberCount || 0);
+
+  let latestVideo = null;
+  const uploads = ch.contentDetails?.relatedPlaylists?.uploads;
+  if (uploads) {
+    const plRes = await youtube.playlistItems.list({ part: 'contentDetails', playlistId: uploads, maxResults: 1 });
+    const videoId = plRes.data.items?.[0]?.contentDetails?.videoId;
+    if (videoId) {
+      const vRes = await youtube.videos.list({ part: 'snippet,statistics', id: videoId });
+      const v = vRes.data.items?.[0];
+      if (v) latestVideo = { videoId, title: v.snippet?.title || '', views: Number(v.statistics?.viewCount || 0) };
+    }
+  }
+  return { channelTitle: ch.snippet?.title || '', subscribers, latestVideo };
+};
+
 const isInvalidGrantError = (err) => {
   const code = err?.response?.data?.error;
   const description = err?.response?.data?.error_description || err?.message || '';
@@ -161,5 +188,5 @@ module.exports = {
   getOAuthClient, exchangeCodeForTokens, refreshAccessToken,
   getChannelInfo, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy,
   listChannelVideos, updateVideoMetadataOnYoutube, deleteVideoFromYoutube,
-  isInvalidGrantError
+  getMilestoneStats, isInvalidGrantError
 };
