@@ -18,6 +18,7 @@ router.get('/pending', protect, async (req, res) => {
             value: milestone.value,
             videoTitle: milestone.videoTitle,
             channelTitle: milestone.channelTitle,
+            channelThumbnail: milestone.channelThumbnail || '', // NEW
             createdAt: milestone.createdAt
           }
         : null
