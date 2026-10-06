@@ -21,11 +21,13 @@ const refreshAccessToken = async (refreshToken) => {
   return credentials;
 };
 
+// ⚠️ UPDATED: also asks for topicDetails + brandingSettings so GET /youtube/channel
+// can work out the channel's niche (used for AI idea suggestions).
 const getChannelInfo = async (accessToken) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken });
   const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-  const res = await youtube.channels.list({ part: 'snippet,statistics', mine: true });
+  const res = await youtube.channels.list({ part: 'snippet,statistics,topicDetails,brandingSettings', mine: true });
   return res.data.items && res.data.items[0];
 };
 
@@ -175,7 +177,10 @@ const getMilestoneStats = async (accessToken) => {
       if (v) latestVideo = { videoId, title: v.snippet?.title || '', views: Number(v.statistics?.viewCount || 0) };
     }
   }
-  return { channelTitle: ch.snippet?.title || '', subscribers, latestVideo };
+  // channelThumbnail is saved on the milestone so the app card + email can show the channel photo.
+  const sn = ch.snippet || {};
+  const channelThumbnail = sn.thumbnails?.high?.url || sn.thumbnails?.medium?.url || sn.thumbnails?.default?.url || '';
+  return { channelTitle: sn.title || '', channelThumbnail, subscribers, latestVideo };
 };
 
 const isInvalidGrantError = (err) => {
