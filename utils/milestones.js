@@ -201,4 +201,4 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
   return doc;
 };
 
-module.exports = { generateMilestoneForUser, MILESTONES };
+module.exports = { generateMilestoneForUser, MILESTONES, buildEmail, describe };
