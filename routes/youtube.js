@@ -40,6 +40,25 @@ const ensureFreshAccessToken = async (user) => {
   return creds.access_token;
 };
 
+// ⚠️ NEW: extra channel info for GET /channel (niche for AI ideas + live subscriber count).
+// Cached per user+channel for 6 hours so the home/profile screens stay fast.
+const channelExtraCache = new Map(); // key: userId:channelId -> { category, subscriberCount, at }
+const CHANNEL_EXTRA_TTL = 6 * 60 * 60 * 1000;
+
+// "Niche" for AI ideas, taken from YouTube's own topic data, else channel keywords.
+const deriveNiche = (info) => {
+  const topics = (info?.topicDetails?.topicCategories || [])
+    .map((u) => {
+      try { return decodeURIComponent(String(u).split('/').pop()).replace(/_/g, ' '); } catch (_) { return ''; }
+    })
+    .filter(Boolean);
+  if (topics.length) return [...new Set(topics)].slice(0, 3).join(', ');
+
+  const kw = info?.brandingSettings?.channel?.keywords;
+  if (kw) return String(kw).replace(/"/g, '').split(/\s+/).filter(Boolean).slice(0, 5).join(' ');
+  return '';
+};
+
 router.get('/oauth/url', protect, (req, res) => {
   const oauth2Client = getOAuthClient();
   const platform = req.query.platform === 'mobile' ? 'mobile' : 'web';
@@ -102,12 +121,38 @@ router.delete('/disconnect', protect, async (req, res) => {
   res.json({ success: true, message: 'YouTube channel disconnected' });
 });
 
+// ⚠️ UPDATED: now also returns `category` (niche for AI ideas) and a live subscriberCount.
 router.get('/channel', protect, async (req, res) => {
   if (!req.user.youtubeChannel) {
     return res.status(404).json({ success: false, message: 'No YouTube channel connected' });
   }
   const { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } = req.user.youtubeChannel;
-  res.json({ success: true, channel: { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } });
+
+  let category = '';
+  let liveSubs = subscriberCount;
+  const key = `${req.user._id}:${channelId}`;
+  const hit = channelExtraCache.get(key);
+
+  if (hit && Date.now() - hit.at < CHANNEL_EXTRA_TTL) {
+    category = hit.category;
+    liveSubs = hit.subscriberCount ?? subscriberCount;
+  } else {
+    try {
+      const accessToken = await ensureFreshAccessToken(req.user);
+      const info = await getChannelInfo(accessToken);
+      category = deriveNiche(info);
+      if (info?.statistics?.subscriberCount != null) liveSubs = info.statistics.subscriberCount;
+      channelExtraCache.set(key, { category, subscriberCount: liveSubs, at: Date.now() });
+    } catch (e) {
+      // Never break the profile/home screen because of this extra info.
+      console.error('⚠️ [YouTube] channel extra info failed:', e.message);
+    }
+  }
+
+  res.json({
+    success: true,
+    channel: { channelId, channelTitle, thumbnail, subscriberCount: liveSubs, connectedAt, category }
+  });
 });
 
 router.get('/my-videos', protect, async (req, res) => {
