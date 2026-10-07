@@ -1,4 +1,6 @@
 const MilestoneTracker = require('../models/MilestoneTracker');
+const KnownChannel = require('../models/KnownChannel');
+const User = require('../models/User');
 const Milestone = require('../models/Milestone');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('./push');
@@ -140,6 +142,20 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
 
   let tracker = await MilestoneTracker.findOne({ user: user._id });
   if (!tracker) tracker = await MilestoneTracker.create({ user: user._id });
+
+  // Different channel than last time -> start fresh and make it due right now.
+  // (Done BEFORE the due-check and the YouTube call, so a brand-new channel is never held back
+  //  by the old channel's timer, and is retried by the daily job if YouTube fails once.)
+  if (tracker.channelId !== user.youtubeChannel.channelId) {
+    tracker.channelId = user.youtubeChannel.channelId;
+    tracker.lastSubMilestone = 0;
+    tracker.videoMilestones = new Map();
+    tracker.lastType = '';
+    tracker.initialCheckDone = false;
+    tracker.nextDueAt = new Date();
+    await tracker.save();
+  }
+
   if (respectDue && tracker.nextDueAt > new Date()) return null;
 
   let stats;
@@ -152,14 +168,6 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
   }
   if (!stats) return null;
 
-  // Different channel connected than last time -> start fresh.
-  if (tracker.channelId !== user.youtubeChannel.channelId) {
-    tracker.channelId = user.youtubeChannel.channelId;
-    tracker.lastSubMilestone = 0;
-    tracker.videoMilestones = new Map();
-    tracker.lastType = '';
-    tracker.initialCheckDone = false;
-  }
   const isFirstCheck = !tracker.initialCheckDone;
 
   const subValue = stats.subscribers != null ? highest(MILESTONES.subscribers, stats.subscribers, tracker.lastSubMilestone) : null;
@@ -201,4 +209,90 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
   return doc;
 };
 
-module.exports = { generateMilestoneForUser, MILESTONES, buildEmail, describe };
+// -----------------------------------------------------------------------
+// ⚠️ NEW: called right after a user connects a YouTube channel.
+//   - Channel NEVER seen before in our database -> card can show NOW (if a milestone is
+//     reached), then the normal 15-day cycle runs.
+//   - Channel ALREADY in our database (reconnect, token re-auth, same channel on another
+//     account) -> NO card now. The 15-day timer decides when the next card comes.
+// -----------------------------------------------------------------------
+const onChannelConnected = async (user) => {
+  const channelId = user.youtubeChannel && user.youtubeChannel.channelId;
+  if (!channelId) return null;
+
+  // Atomic "have we seen this channel?" check: returns the OLD doc, or null if it was just inserted.
+  const previous = await KnownChannel.findOneAndUpdate(
+    { channelId },
+    { $setOnInsert: { firstUser: user._id, firstSeenAt: new Date() } },
+    { upsert: true, new: false }
+  );
+
+  if (!previous) {
+    // Brand-new channel -> check now (ignores any old timer).
+    return generateMilestoneForUser(user, { respectDue: false });
+  }
+
+  // Already known -> no card now.
+  const nextDue = new Date(Date.now() + CYCLE_DAYS * DAY_MS);
+  const tracker = await MilestoneTracker.findOne({ user: user._id });
+  if (!tracker) {
+    await MilestoneTracker.create({ user: user._id, channelId, initialCheckDone: true, nextDueAt: nextDue });
+    return null;
+  }
+  if (tracker.channelId !== channelId) {
+    // User switched to a different, already-known channel: fresh memory, 15-day wait.
+    tracker.channelId = channelId;
+    tracker.lastSubMilestone = 0;
+    tracker.videoMilestones = new Map();
+    tracker.lastType = '';
+    tracker.initialCheckDone = true;
+    tracker.nextDueAt = nextDue;
+    await tracker.save();
+  }
+  // Same channel as before: timer is left exactly as it is (disconnect/reconnect can't skip or reset it).
+  return null;
+};
+
+// -----------------------------------------------------------------------
+// ⚠️ NEW: one-time catch-up, safe to run on every server start (idempotent).
+// Users who already had a channel connected BEFORE the milestone feature have no tracker yet,
+// so the daily job would never pick them up. This gives each of them a tracker whose first
+// card is due 15 days from now, and records their channel as "already in our database".
+// -----------------------------------------------------------------------
+const backfillMilestoneTrackers = async () => {
+  try {
+    const dueAt = new Date(Date.now() + CYCLE_DAYS * DAY_MS);
+    let added = 0;
+
+    // Channels that only exist on old trackers (user disconnected since) also count as known.
+    const oldIds = (await MilestoneTracker.distinct('channelId')).filter(Boolean);
+    for (const channelId of oldIds) {
+      await KnownChannel.updateOne({ channelId }, { $setOnInsert: { firstSeenAt: new Date() } }, { upsert: true });
+    }
+
+    const cursor = User.find({ 'youtubeChannel.channelId': { $exists: true, $nin: [null, ''] } })
+      .select('_id youtubeChannel.channelId')
+      .lean()
+      .cursor();
+
+    for (let u = await cursor.next(); u; u = await cursor.next()) {
+      const channelId = u.youtubeChannel.channelId;
+      await KnownChannel.updateOne(
+        { channelId },
+        { $setOnInsert: { firstUser: u._id, firstSeenAt: new Date() } },
+        { upsert: true }
+      );
+      const r = await MilestoneTracker.updateOne(
+        { user: u._id },
+        { $setOnInsert: { channelId, initialCheckDone: true, nextDueAt: dueAt } },
+        { upsert: true, setDefaultsOnInsert: true }
+      );
+      if (r.upsertedCount) added++;
+    }
+    console.log(`🏆 [Milestone] backfill done — ${added} existing user(s) added (first card in ${CYCLE_DAYS} days)`);
+  } catch (err) {
+    console.error('⚠️ [Milestone] backfill failed:', err.message);
+  }
+};
+
+module.exports = { generateMilestoneForUser, onChannelConnected, backfillMilestoneTrackers, MILESTONES, buildEmail, describe };
