@@ -34,6 +34,7 @@ const seedAdminRoute = require('./routes/seedAdmin');
 const uploadsRoutes = require('./routes/uploads');
 const oauthRoutes = require('./routes/oauth');
 const milestoneRoutes = require('./routes/milestones');
+const { backfillMilestoneTrackers } = require('./utils/milestones');
 
 const app = express();
 
@@ -230,6 +231,7 @@ const startServer = async () => {
       startFreeUploadReset();
       startDriveAutoUploadScheduler();
       startMilestoneScheduler();
+      backfillMilestoneTrackers(); // one-time catch-up for users who connected a channel before this feature
     });
   } catch (error) {
     console.error('❌ Fatal Server Startup Error:', error.message);
