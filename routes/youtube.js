@@ -9,7 +9,7 @@ const {
   setThumbnail, isInvalidGrantError
 } = require('../utils/youtube');
 const User = require('../models/User');
-const { generateMilestoneForUser } = require('../utils/milestones');
+const { onChannelConnected } = require('../utils/milestones');
 
 const router = express.Router();
 
@@ -98,8 +98,8 @@ router.get('/oauth/callback', async (req, res) => {
     };
     await user.save();
 
-    // ⚠️ NEW: first milestone card right after channel connect (runs in background)
-    generateMilestoneForUser(user).catch((e) => console.error('Milestone on connect failed:', e.message));
+    // ⚠️ NEW: brand-new channel -> milestone card can show now; channel already in our DB -> card after 15 days
+    onChannelConnected(user).catch((e) => console.error('Milestone on connect failed:', e.message));
 
     if (platform === 'mobile') {
       res.redirect('tubepilot://oauth-success?youtube_connected=1');
