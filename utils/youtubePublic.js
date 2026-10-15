@@ -77,4 +77,6 @@ const fetchCompetitorStats = async ({ channelId, handle, mode = 'advance' }) => 
   };
 };
 
-module.exports = { resolvePublicChannel, computeChannelVph, fetchCompetitorStats };
+// ⚠️ CHANGED (Competitor Radar upgrade): getYoutubeClient is now exported so
+// utils/competitorIngest.js can reuse the same API-key client.
+module.exports = { getYoutubeClient, resolvePublicChannel, computeChannelVph, fetchCompetitorStats };
