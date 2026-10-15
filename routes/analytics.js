@@ -4,6 +4,13 @@ const Video = require('../models/Video');
 const Competitor = require('../models/Competitor');
 const { refreshAccessToken, isInvalidGrantError } = require('../utils/youtube');
 const { fetchCompetitorStats } = require('../utils/youtubePublic');
+const mongoose = require('mongoose');
+const CompetitorVideo = require('../models/CompetitorVideo');
+const CompetitorVideoSnapshot = require('../models/CompetitorVideoSnapshot');
+const CompetitorChannelSnapshot = require('../models/CompetitorChannelSnapshot');
+const { normalizeLevel, getCompetitorLimit, hasAdvancedInsights, limitReachedBody } = require('../utils/competitorLimits');
+const { competitorChannelId, ensureChannelsFresh, ingestInBackground } = require('../utils/competitorIngest');
+const insights = require('../utils/competitorInsights');
 const { google } = require('googleapis');
 const router = express.Router();
 
@@ -58,6 +65,37 @@ router.get('/', protect, async (req, res) => {
 // ---------------------------------------------------------------------------
 // Competitor Tracking
 // ---------------------------------------------------------------------------
+// ⚠️ UPGRADED (Competitor Radar): per-plan competitor limits (enforced HERE,
+// not only in the app), shared daily snapshots, and the dashboard / detail /
+// video-list endpoints. Plan limits: none(free)=2, basic=5, advance=15 —
+// see utils/competitorLimits.js. Existing competitors are NEVER deleted when
+// a limit is applied; an over-limit user keeps and can view all of them but
+// cannot add new ones until they are below the limit.
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const STALE_STATS_MS = 6 * 60 * 60 * 1000;
+
+const compLabel = (c) => c.label || c.handle || c.channelId || '';
+
+const buildMeta = (user, count) => {
+  const level = normalizeLevel(user.competitorLevel);
+  const limit = getCompetitorLimit(level);
+  return { level, limit, count, canAdd: count < limit, advanced: hasAdvancedInsights(level) };
+};
+
+// VPH is the deeper (advance-only) metric — never leak it to lower plans,
+// even if an older cache from a previous higher plan still holds it.
+const shapeCompetitor = (c, advanced) => {
+  const obj = c.toObject ? c.toObject() : { ...c };
+  if (!advanced && obj.lastStats) obj.lastStats.vph = null;
+  return obj;
+};
+
+// Search typeahead: search.list costs 100 YouTube quota units per call, so
+// identical queries are served from a short in-memory cache.
+const searchCache = new Map();
+const SEARCH_TTL_MS = 10 * 60 * 1000;
+const SEARCH_CACHE_MAX = 500;
 
 // @route GET /api/analytics/competitors/search?q=tube
 router.get('/competitors/search', protect, async (req, res) => {
@@ -68,6 +106,12 @@ router.get('/competitors/search', protect, async (req, res) => {
     const apiKey = process.env.YOUTUBE_DATA_API_KEY;
     if (!apiKey) {
       return res.status(503).json({ success: false, message: 'YouTube search is unavailable — YOUTUBE_DATA_API_KEY not configured on the server.' });
+    }
+
+    const cacheKey = q.toLowerCase();
+    const hit = searchCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < SEARCH_TTL_MS) {
+      return res.json({ success: true, results: hit.results, cached: true });
     }
 
     const youtube = google.youtube({ version: 'v3', auth: apiKey });
@@ -85,6 +129,9 @@ router.get('/competitors/search', protect, async (req, res) => {
       thumbnail: item.snippet.thumbnails?.default?.url || ''
     }));
 
+    if (searchCache.size >= SEARCH_CACHE_MAX) searchCache.delete(searchCache.keys().next().value);
+    searchCache.set(cacheKey, { at: Date.now(), results });
+
     res.json({ success: true, results });
   } catch (err) {
     console.error('❌ [Competitor Search] failed:', err.response?.data || err.message);
@@ -92,38 +139,38 @@ router.get('/competitors/search', protect, async (req, res) => {
   }
 });
 
+// Loads the user's competitors and refreshes any whose cached channel stats are > 6h old.
+const loadCompetitorsFresh = async (user) => {
+  const competitors = await Competitor.find({ user: user._id }).sort({ createdAt: -1 });
+  await Promise.all(
+    competitors.map(async (c) => {
+      const isStale = !c.lastStats?.fetchedAt || Date.now() - new Date(c.lastStats.fetchedAt).getTime() > STALE_STATS_MS;
+      if (!isStale) return;
+      try {
+        c.lastStats = await fetchCompetitorStats({ channelId: c.channelId, handle: c.handle, mode: normalizeLevel(user.competitorLevel) });
+        await c.save();
+      } catch (err) {
+        c.lastStats = { ...(c.lastStats?.toObject ? c.lastStats.toObject() : c.lastStats), error: err.message, fetchedAt: c.lastStats?.fetchedAt || null };
+        await c.save();
+      }
+    })
+  );
+  return competitors;
+};
+
 // @route GET /api/analytics/competitors
 router.get('/competitors', protect, async (req, res) => {
   try {
-    const competitors = await Competitor.find({ user: req.user._id }).sort({ createdAt: -1 });
-    const STALE_MS = 6 * 60 * 60 * 1000;
-
-    await Promise.all(
-      competitors.map(async (c) => {
-        const isStale = !c.lastStats?.fetchedAt || Date.now() - new Date(c.lastStats.fetchedAt).getTime() > STALE_MS;
-        if (!isStale) return;
-        try {
-          c.lastStats = await fetchCompetitorStats({ channelId: c.channelId, handle: c.handle, mode: req.user.competitorLevel });
-          await c.save();
-        } catch (err) {
-          c.lastStats = { ...(c.lastStats?.toObject ? c.lastStats.toObject() : c.lastStats), error: err.message, fetchedAt: c.lastStats?.fetchedAt || null };
-          await c.save();
-        }
-      })
-    );
-
-    // basic-tier users only see subscriberCount/viewCount/videoCount — the
-    // deeper VPH/trend signal is stripped from the response for them
-    // (still gated even if a stale cache had it from a previous higher plan).
-    const responseCompetitors = req.user.competitorLevel === 'basic'
-      ? competitors.map((c) => {
-          const obj = c.toObject();
-          if (obj.lastStats) obj.lastStats.vph = null;
-          return obj;
-        })
-      : competitors;
-
-    res.json({ success: true, competitors: responseCompetitors, competitorLevel: req.user.competitorLevel });
+    const competitors = await loadCompetitorsFresh(req.user);
+    const meta = buildMeta(req.user, competitors.length);
+    res.json({
+      success: true,
+      competitors: competitors.map((c) => shapeCompetitor(c, meta.advanced)),
+      competitorLevel: meta.level,
+      limit: meta.limit,
+      count: meta.count,
+      canAdd: meta.canAdd
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -132,19 +179,30 @@ router.get('/competitors', protect, async (req, res) => {
 // @route POST /api/analytics/competitors  { channelId?, handle?, label? }
 router.post('/competitors', protect, async (req, res) => {
   try {
-    if (req.user.competitorLevel === 'none') {
-      return res.status(402).json({ success: false, message: 'Competitor Analysis is not included in your current plan. Please upgrade from the Diamond Store.', code: 'PLAN_UPGRADE_REQUIRED' });
-    }
-
     const { channelId, handle, label } = req.body;
     if (!channelId && !handle) {
       return res.status(400).json({ success: false, message: 'Provide either channelId or handle' });
     }
 
-    const existing = await Competitor.findOne({
-      user: req.user._id,
-      $or: [{ channelId: channelId || null }, { handle: handle || null }]
-    });
+    const level = normalizeLevel(req.user.competitorLevel);
+    const limit = getCompetitorLimit(level);
+
+    // ---- plan limit (enforced on the server) ----
+    const current = await Competitor.countDocuments({ user: req.user._id });
+    if (current >= limit) {
+      return res.status(403).json(limitReachedBody({ level, current }));
+    }
+
+    // ---- duplicate check ----
+    // ⚠️ FIX: the old query was `$or: [{channelId: x || null}, {handle: y || null}]`.
+    // When only a channelId was sent, `{handle: null}` matched EVERY competitor
+    // that had been added by channelId (their handle is null) — so a second
+    // competitor was always rejected as "already tracked". Only the fields
+    // that were actually provided are compared now.
+    const or = [];
+    if (channelId) or.push({ channelId }, { 'lastStats.resolvedChannelId': channelId });
+    if (handle) or.push({ handle });
+    const existing = await Competitor.findOne({ user: req.user._id, $or: or });
     if (existing) {
       return res.status(409).json({ success: false, message: 'This competitor is already being tracked', competitor: existing });
     }
@@ -156,16 +214,50 @@ router.post('/competitors', protect, async (req, res) => {
       label: label || handle || channelId
     });
 
+    // ---- race guard: two parallel adds can both pass the count check above.
+    // Only the first `limit` documents (by creation order) are kept. ----
+    const keep = await Competitor.find({ user: req.user._id }).sort({ _id: 1 }).limit(limit).select('_id').lean();
+    if (!keep.some((k) => String(k._id) === String(competitor._id))) {
+      await Competitor.deleteOne({ _id: competitor._id });
+      return res.status(403).json(limitReachedBody({ level, current: limit }));
+    }
+
     try {
-      competitor.lastStats = await fetchCompetitorStats({ channelId, handle, mode: req.user.competitorLevel });
+      competitor.lastStats = await fetchCompetitorStats({ channelId, handle, mode: level });
       if (!competitor.label && competitor.lastStats.resolvedChannelId) competitor.label = handle || channelId;
       await competitor.save();
     } catch (err) {
+      // A channel that does not exist must not eat one of the user's slots.
+      if (/^Channel not found/i.test(err.message)) {
+        await Competitor.deleteOne({ _id: competitor._id });
+        return res.status(404).json({ success: false, message: err.message });
+      }
       competitor.lastStats = { error: err.message, fetchedAt: null };
       await competitor.save();
     }
 
-    res.status(201).json({ success: true, competitor });
+    // Same channel added twice under different forms (e.g. @handle then ID).
+    const resolvedId = competitor.lastStats?.resolvedChannelId;
+    if (resolvedId) {
+      const dup = await Competitor.findOne({
+        user: req.user._id,
+        _id: { $ne: competitor._id },
+        $or: [{ channelId: resolvedId }, { 'lastStats.resolvedChannelId': resolvedId }]
+      });
+      if (dup) {
+        await Competitor.deleteOne({ _id: competitor._id });
+        return res.status(409).json({ success: false, message: 'This competitor is already being tracked', competitor: dup });
+      }
+      // Collect the first video snapshot right away (background, never blocks the response).
+      ingestInBackground([resolvedId]);
+    }
+
+    res.status(201).json({
+      success: true,
+      competitor: shapeCompetitor(competitor, hasAdvancedInsights(level)),
+      limit,
+      count: await Competitor.countDocuments({ user: req.user._id })
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -177,6 +269,238 @@ router.delete('/competitors/:id', protect, async (req, res) => {
     const competitor = await Competitor.findOneAndDelete({ _id: req.params.id, user: req.user._id });
     if (!competitor) return res.status(404).json({ success: false, message: 'Competitor not found' });
     res.json({ success: true, message: 'Competitor removed' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Competitor Radar — dashboard / details / video lists
+// ---------------------------------------------------------------------------
+
+const toVideoItem = (v, comp, growthMap, outMap, nowMs) => {
+  const vpd = insights.viewsPerDay(v, nowMs);
+  return {
+    videoId: v.videoId,
+    url: `https://www.youtube.com/watch?v=${v.videoId}`,
+    channelId: v.channelId,
+    competitorId: comp ? String(comp._id) : null,
+    channelLabel: comp ? compLabel(comp) : '',
+    channelThumbnail: comp?.lastStats?.thumbnail || '',
+    title: v.title,
+    thumbnail: v.thumbnail,
+    publishedAt: v.publishedAt,
+    durationSec: v.durationSec,
+    views: v.stats?.viewCount ?? 0,           // TOTAL views (not growth)
+    likes: v.stats?.likeCount ?? null,
+    comments: v.stats?.commentCount ?? null,
+    viewsPerDay: vpd === null ? null : Math.round(vpd),
+    growth: growthMap.get(v.videoId) || null, // MEASURED growth between two real snapshots, else null
+    outperform: outMap.get(v.videoId) || null
+  };
+};
+
+const sortItems = (items, sort) => {
+  const list = items.slice();
+  switch (sort) {
+    case 'recent':
+      return list.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
+    case 'fastest':
+      return list.filter((i) => i.growth).sort((a, b) => b.growth.viewsPerHour - a.growth.viewsPerHour);
+    case 'outperforming':
+      return list.filter((i) => i.outperform).sort((a, b) => b.outperform.ratio - a.outperform.ratio);
+    case 'most_viewed':
+    default:
+      return list.sort((a, b) => b.views - a.views);
+  }
+};
+
+// Gathers everything the dashboard / detail / list endpoints need for a set of competitors.
+const loadRadarContext = async (user, comps, totalCount = comps.length) => {
+  const meta = buildMeta(user, totalCount);
+  const chToComp = new Map();
+  comps.forEach((c) => {
+    const id = competitorChannelId(c);
+    if (id) chToComp.set(id, c);
+  });
+  const channelIds = [...chToComp.keys()];
+  const { refreshing } = await ensureChannelsFresh(channelIds);
+
+  const since = new Date(Date.now() - insights.WINDOW_DAYS * DAY_MS);
+  const videos = channelIds.length
+    ? await CompetitorVideo.find({ channelId: { $in: channelIds }, publishedAt: { $gte: since } }).lean()
+    : [];
+
+  const nowMs = Date.now();
+  const growthMap = meta.advanced ? await insights.computeGrowthMap(videos.map((v) => v.videoId), nowMs) : new Map();
+  const outMap = insights.computeOutperforming(videos, nowMs);
+  const items = videos.map((v) => toVideoItem(v, chToComp.get(v.channelId), growthMap, outMap, nowMs));
+
+  let firstSnapshotAt = null;
+  if (channelIds.length) {
+    const first = await CompetitorVideoSnapshot.findOne({ channelId: { $in: channelIds } }).sort({ capturedAt: 1 }).select('capturedAt').lean();
+    firstSnapshotAt = first ? first.capturedAt : null;
+  }
+
+  return { meta, chToComp, channelIds, refreshing, videos, items, firstSnapshotAt };
+};
+
+const withChannelLabel = (topics, chToComp) =>
+  topics.map((t) => ({
+    ...t,
+    exampleVideo: { ...t.exampleVideo, channelLabel: chToComp.get(t.exampleVideo.channelId) ? compLabel(chToComp.get(t.exampleVideo.channelId)) : '' }
+  }));
+
+const growthInfo = (ctx) => ({
+  // `ready` = at least one video has a measured growth number.
+  ready: ctx.meta.advanced && ctx.items.some((i) => i.growth),
+  measuredVideos: ctx.items.filter((i) => i.growth).length,
+  firstSnapshotAt: ctx.firstSnapshotAt
+});
+
+// @route GET /api/analytics/competitors/dashboard
+router.get('/competitors/dashboard', protect, async (req, res) => {
+  try {
+    const comps = await loadCompetitorsFresh(req.user);
+    const ctx = await loadRadarContext(req.user, comps);
+    const adv = ctx.meta.advanced;
+
+    let fastestGrowing = null;
+    let topics = null;
+    let opportunities = null;
+    if (adv) {
+      fastestGrowing = sortItems(ctx.items, 'fastest').slice(0, 8);
+      topics = withChannelLabel(
+        insights.extractTopics(ctx.videos, { minVideos: 2, minChannels: ctx.channelIds.length >= 2 ? 2 : 1, limit: 10 }),
+        ctx.chToComp
+      );
+      const own = await insights.getOwnTitles(req.user);
+      opportunities = withChannelLabel(insights.buildOpportunities(ctx.videos, own, ctx.channelIds.length), ctx.chToComp);
+    }
+
+    res.json({
+      success: true,
+      meta: ctx.meta,
+      refreshing: ctx.refreshing,
+      windowDays: insights.WINDOW_DAYS,
+      summary: { tracked: comps.length, videosAnalysed: ctx.items.length },
+      competitors: comps.map((c) => shapeCompetitor(c, adv)),
+      topVideos: sortItems(ctx.items, 'most_viewed').slice(0, 5),
+      recentVideos: sortItems(ctx.items, 'recent').slice(0, 8),
+      outperforming: sortItems(ctx.items, 'outperforming').slice(0, 5),
+      fastestGrowing,           // null = locked on this plan
+      topics,                   // null = locked on this plan
+      opportunities,            // null = locked on this plan
+      growth: growthInfo(ctx),
+      locked: { growth: !adv, topics: !adv, opportunities: !adv }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+const MAX_LIST = 50;
+
+const sendVideoList = async (req, res, comps, totalCount = comps.length) => {
+  const sort = ['most_viewed', 'recent', 'fastest', 'outperforming'].includes(req.query.sort) ? req.query.sort : 'most_viewed';
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), MAX_LIST);
+  const meta = buildMeta(req.user, totalCount);
+  if (sort === 'fastest' && !meta.advanced) {
+    return res.status(403).json({ success: false, code: 'FEATURE_LOCKED', message: 'Fastest Growing videos are available on the Advanced plan.' });
+  }
+  const ctx = await loadRadarContext(req.user, comps, totalCount);
+  res.json({
+    success: true,
+    sort,
+    meta: ctx.meta,
+    refreshing: ctx.refreshing,
+    windowDays: insights.WINDOW_DAYS,
+    growth: growthInfo(ctx),
+    videos: sortItems(ctx.items, sort).slice(0, limit)
+  });
+};
+
+// @route GET /api/analytics/competitors/videos?sort=most_viewed|recent|fastest|outperforming&limit=30
+// (all of the user's tracked competitors together)
+router.get('/competitors/videos', protect, async (req, res) => {
+  try {
+    const comps = await Competitor.find({ user: req.user._id }).sort({ createdAt: -1 }).lean();
+    await sendVideoList(req, res, comps);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+const findOwnedCompetitor = async (req) => {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return null;
+  return Competitor.findOne({ _id: req.params.id, user: req.user._id }).lean();
+};
+
+// @route GET /api/analytics/competitors/:id/videos?sort=...&limit=...
+router.get('/competitors/:id/videos', protect, async (req, res) => {
+  try {
+    const comp = await findOwnedCompetitor(req);
+    if (!comp) return res.status(404).json({ success: false, message: 'Competitor not found' });
+    // plan flags/count are based on ALL the user's competitors; the list is just this one channel
+    const all = await Competitor.countDocuments({ user: req.user._id });
+    await sendVideoList(req, res, [comp], all);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// @route GET /api/analytics/competitors/:id   (detail screen)
+router.get('/competitors/:id', protect, async (req, res) => {
+  try {
+    const comp = await findOwnedCompetitor(req);
+    if (!comp) return res.status(404).json({ success: false, message: 'Competitor not found' });
+
+    const all = await Competitor.countDocuments({ user: req.user._id });
+    const ctx = await loadRadarContext(req.user, [comp], all);
+    const adv = ctx.meta.advanced;
+    const channelId = competitorChannelId(comp);
+    const stats = comp.lastStats || {};
+
+    let fastestGrowing = null;
+    let topics = null;
+    let series = null;
+    if (adv) {
+      fastestGrowing = sortItems(ctx.items, 'fastest').slice(0, 5);
+      topics = withChannelLabel(insights.extractTopics(ctx.videos, { minVideos: 2, minChannels: 1, limit: 10 }), ctx.chToComp);
+      if (channelId) {
+        const rows = await CompetitorChannelSnapshot.find({ channelId, capturedAt: { $gte: new Date(Date.now() - 30 * DAY_MS) } })
+          .sort({ day: 1 }).select('day subscriberCount viewCount videoCount').lean();
+        series = rows.map((r) => ({ day: r.day, subscribers: r.subscriberCount, views: r.viewCount, videos: r.videoCount }));
+      }
+    }
+
+    res.json({
+      success: true,
+      meta: ctx.meta,
+      refreshing: ctx.refreshing,
+      windowDays: insights.WINDOW_DAYS,
+      channel: {
+        id: String(comp._id),
+        channelId,
+        label: compLabel(comp),
+        handle: comp.handle,
+        thumbnail: stats.thumbnail || '',
+        subscriberCount: stats.subscriberCount ?? null,
+        viewCount: stats.viewCount ?? null,
+        videoCount: stats.videoCount ?? null,
+        vph: adv ? (stats.vph ?? null) : null,
+        url: channelId ? `https://www.youtube.com/channel/${channelId}` : null,
+        error: stats.error || null
+      },
+      mostViewed: sortItems(ctx.items, 'most_viewed').slice(0, 5),
+      recent: sortItems(ctx.items, 'recent').slice(0, 8),
+      outperforming: sortItems(ctx.items, 'outperforming').slice(0, 5),
+      fastestGrowing,   // null = locked on this plan
+      topics,           // null = locked on this plan
+      series,           // channel trend (daily snapshots); null = locked on this plan
+      growth: growthInfo(ctx),
+      locked: { growth: !adv, topics: !adv, trend: !adv }
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
