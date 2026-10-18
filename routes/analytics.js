@@ -12,6 +12,7 @@ const { normalizeLevel, getCompetitorLimit, hasAdvancedInsights, limitReachedBod
 const { competitorChannelId, ensureChannelsFresh, ingestInBackground } = require('../utils/competitorIngest');
 const insights = require('../utils/competitorInsights');
 const { google } = require('googleapis');
+const { buildAuditReport } = require('../utils/channelAudit');
 const router = express.Router();
 
 router.get('/', protect, async (req, res) => {
@@ -626,14 +627,16 @@ router.get('/audit', protect, async (req, res) => {
     let engagementPct = null;
     let shortToLongRatio = null;
     let recentVideoCount = 0;
+    let auditVideos = [];
 
     if (uploadsPlaylistId) {
-      const playlistRes = await youtube.playlistItems.list({ part: 'contentDetails', playlistId: uploadsPlaylistId, maxResults: 20 });
+      const playlistRes = await youtube.playlistItems.list({ part: 'contentDetails', playlistId: uploadsPlaylistId, maxResults: 50 });
       const videoIds = (playlistRes.data.items || []).map((i) => i.contentDetails.videoId).filter(Boolean);
 
       if (videoIds.length) {
         const videosRes = await youtube.videos.list({ part: 'statistics,contentDetails,snippet', id: videoIds.join(',') });
         const videos = videosRes.data.items || [];
+        auditVideos = videos;
 
         const engagementRates = videos
           .map((v) => {
@@ -699,8 +702,35 @@ router.get('/audit', protect, async (req, res) => {
     // Video SEO Optimizer's gate in routes/ai.js.
     const channelSeoUnlocked = req.user.seoScoreLevel === 'advance';
 
+    // Full audit report (health score + the 5 cards). Built from real API data only.
+    const parseIso = (iso) => {
+      const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || '');
+      return m ? (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0) : 0;
+    };
+    let report = null;
+    try {
+      report = buildAuditReport({
+        channel: {
+          description,
+          hasBanner,
+          hasHandle: !!channel.snippet?.customUrl
+        },
+        videos: auditVideos.map((v) => ({
+          videoId: v.id,
+          title: v.snippet?.title || '',
+          thumbnail: v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || '',
+          publishedAt: v.snippet?.publishedAt ? new Date(v.snippet.publishedAt).getTime() : null,
+          durationSec: parseIso(v.contentDetails?.duration),
+          views: Number(v.statistics?.viewCount || 0),
+          likes: v.statistics?.likeCount !== undefined ? Number(v.statistics.likeCount) : null,
+          comments: v.statistics?.commentCount !== undefined ? Number(v.statistics.commentCount) : null
+        }))
+      });
+    } catch (_) { report = null; }
+
     res.json({
       success: true,
+      report,
       audit: {
         subscriberCount: Number(channel.statistics?.subscriberCount || 0),
         totalViews: Number(channel.statistics?.viewCount || 0),
