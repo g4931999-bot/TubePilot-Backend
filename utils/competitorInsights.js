@@ -113,6 +113,8 @@ const STOP = new Set((
   'more most other some such only own same too very into out up down over under again about after before between during through above below off ' +
   // YouTube filler
   'video videos new latest official full part episode ep hd 4k live shorts short vs ft feat channel subscribe watch like comment share ' +
+  // Generic words that say nothing about a topic
+  'big last power must best top most one two three first second get got make made makes see seen say says said know going gone want need back way ways thing things now today why because every really still even also many much never always ever ' +
   // Roman Hindi / Hinglish filler
   'ka ki ke ko se me mein par pe hai hain tha thi the ho hota hoti hote kya kaise kyun kyu ye yeh wo woh aur ya bhi to toh ek is us in un ne se liye lie wala wali wale ' +
   'apna apni apne mera meri mere tera teri tere hum tum aap aapka aapki main mai nahi nahin ab abhi bas sab sabse kuch bahut ' +
@@ -176,7 +178,20 @@ const extractTopics = (videos, { minVideos = 2, minChannels = 1, limit = 10 } = 
       avgViews: Math.round(avg),
       // >1 means videos on this topic get more views than the typical video in this set
       strength: overallMedian && overallMedian > 0 ? round1(avg / overallMedian) : null,
-      exampleVideo: { videoId: best.videoId, title: best.title, views: best.stats?.viewCount || 0, channelId: best.channelId }
+      exampleVideo: { videoId: best.videoId, title: best.title, views: best.stats?.viewCount || 0, channelId: best.channelId },
+      // The videos that make this topic "trend" (top 3 by total views) - so the app can show WHO is winning.
+      topVideos: e.videos
+        .slice()
+        .sort((a, b) => (b.stats?.viewCount || 0) - (a.stats?.viewCount || 0))
+        .slice(0, 3)
+        .map((v) => ({
+          videoId: v.videoId,
+          title: v.title,
+          thumbnail: v.thumbnail,
+          views: v.stats?.viewCount || 0,
+          publishedAt: v.publishedAt,
+          channelId: v.channelId
+        }))
     });
   });
 
