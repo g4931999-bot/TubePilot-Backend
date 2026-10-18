@@ -3,7 +3,7 @@ const { protect } = require('../middleware/auth');
 const Video = require('../models/Video');
 const Competitor = require('../models/Competitor');
 const { refreshAccessToken, isInvalidGrantError } = require('../utils/youtube');
-const { fetchCompetitorStats } = require('../utils/youtubePublic');
+const { fetchCompetitorStats, getYoutubeClient } = require('../utils/youtubePublic');
 const mongoose = require('mongoose');
 const CompetitorVideo = require('../models/CompetitorVideo');
 const CompetitorVideoSnapshot = require('../models/CompetitorVideoSnapshot');
@@ -348,7 +348,18 @@ const loadRadarContext = async (user, comps, totalCount = comps.length) => {
 const withChannelLabel = (topics, chToComp) =>
   topics.map((t) => ({
     ...t,
-    exampleVideo: { ...t.exampleVideo, channelLabel: chToComp.get(t.exampleVideo.channelId) ? compLabel(chToComp.get(t.exampleVideo.channelId)) : '' }
+    exampleVideo: { ...t.exampleVideo, channelLabel: chToComp.get(t.exampleVideo.channelId) ? compLabel(chToComp.get(t.exampleVideo.channelId)) : '' },
+    topVideos: (t.topVideos || []).map((v) => {
+      const comp = chToComp.get(v.channelId);
+      return {
+        ...v,
+        url: `https://www.youtube.com/watch?v=${v.videoId}`,
+        views: v.views,
+        competitorId: comp ? String(comp._id) : null,
+        channelLabel: comp ? compLabel(comp) : '',
+        channelThumbnail: comp?.lastStats?.thumbnail || ''
+      };
+    })
   }));
 
 const growthInfo = (ctx) => ({
@@ -437,6 +448,52 @@ const findOwnedCompetitor = async (req) => {
 };
 
 // @route GET /api/analytics/competitors/:id/videos?sort=...&limit=...
+// @route GET /api/analytics/competitors/video/:videoId
+// Full public details of ONE competitor video (description, tags, best thumbnail)
+// so the app can let the user copy them. Only videos of channels the user tracks.
+router.get('/competitors/video/:videoId', protect, async (req, res) => {
+  try {
+    const videoId = String(req.params.videoId || '');
+    if (!/^[\w-]{11}$/.test(videoId)) return res.status(400).json({ success: false, message: 'Invalid video id' });
+
+    const stored = await CompetitorVideo.findOne({ videoId }).lean();
+    if (!stored) return res.status(404).json({ success: false, message: 'Video not found' });
+
+    const comps = await Competitor.find({ user: req.user._id });
+    const owned = comps.some((c) => competitorChannelId(c) === stored.channelId);
+    if (!owned) return res.status(404).json({ success: false, message: 'Video not found' });
+
+    let description = null;
+    let tags = stored.tags || [];
+    let title = stored.title;
+    try {
+      const yt = getYoutubeClient();
+      const r = await yt.videos.list({ part: 'snippet', id: videoId });
+      const item = r.data.items && r.data.items[0];
+      if (item) {
+        description = item.snippet?.description || '';
+        tags = item.snippet?.tags || tags;
+        title = item.snippet?.title || title;
+      }
+    } catch (_) { /* keep stored data; description stays null */ }
+
+    res.json({
+      success: true,
+      video: {
+        videoId,
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        title,
+        description,          // null = could not be fetched right now
+        tags,
+        thumbnailMax: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+        thumbnailHigh: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get('/competitors/:id/videos', protect, async (req, res) => {
   try {
     const comp = await findOwnedCompetitor(req);
