@@ -69,13 +69,18 @@ const updateVideoPrivacy = async ({ accessToken, refreshToken, videoId, privacyS
   return res.data;
 };
 
-// ⚠️ UPDATED (Boss request — "My Videos" screen needs tags too, for
-// editing): playlistItems.list's snippet does NOT include tags, only
-// videos.list's snippet does — so this now makes a second batched call
-// (one videos.list for up to `maxResults` ids) to pull tags/description
-// alongside title/thumbnail. Still just 2 API calls total per screen
-// load (channels.list + playlistItems.list + videos.list = 3, but all
-// cheap/quota-light list calls).
+// ⚠️ UPDATED (UPDATE14 — Video SEO Optimizer / Visual Analyzer): every video now
+// also carries REAL `viewCount`, `durationSeconds` and `isShort`, read from the
+// same videos.list call (parts snippet,statistics,contentDetails — no extra quota).
+// `isShort` = duration <= 180s. The YouTube Data API has NO "is Short" flag, so
+// this is the closest real signal (Shorts can now be up to 3 minutes).
+// `maxResults` can go up to 200 (paged 50 at a time); default stays 25.
+const parseIsoDuration = (iso) => {
+  const m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || '');
+  if (!m) return 0;
+  return (+m[1] || 0) * 86400 + (+m[2] || 0) * 3600 + (+m[3] || 0) * 60 + (+m[4] || 0);
+};
+
 const listChannelVideos = async (accessToken, { maxResults = 25 } = {}) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken });
@@ -85,28 +90,48 @@ const listChannelVideos = async (accessToken, { maxResults = 25 } = {}) => {
   const uploadsPlaylistId = channelRes.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
   if (!uploadsPlaylistId) return [];
 
-  const itemsRes = await youtube.playlistItems.list({
-    part: 'snippet',
-    playlistId: uploadsPlaylistId,
-    maxResults
-  });
-
-  const videoIds = (itemsRes.data.items || []).map((i) => i.snippet.resourceId.videoId).filter(Boolean);
+  const wanted = Math.max(1, Math.min(Number(maxResults) || 25, 200));
+  const videoIds = [];
+  let pageToken;
+  while (videoIds.length < wanted) {
+    const itemsRes = await youtube.playlistItems.list({
+      part: 'snippet',
+      playlistId: uploadsPlaylistId,
+      maxResults: Math.min(50, wanted - videoIds.length),
+      pageToken
+    });
+    (itemsRes.data.items || []).forEach((i) => {
+      const id = i.snippet?.resourceId?.videoId;
+      if (id) videoIds.push(id);
+    });
+    pageToken = itemsRes.data.nextPageToken;
+    if (!pageToken) break;
+  }
   if (!videoIds.length) return [];
 
-  const videosRes = await youtube.videos.list({ part: 'snippet', id: videoIds.join(',') });
   const detailsById = {};
-  (videosRes.data.items || []).forEach((v) => { detailsById[v.id] = v.snippet; });
+  for (let i = 0; i < videoIds.length; i += 50) {
+    const chunk = videoIds.slice(i, i + 50);
+    const videosRes = await youtube.videos.list({ part: 'snippet,statistics,contentDetails', id: chunk.join(',') });
+    (videosRes.data.items || []).forEach((v) => { detailsById[v.id] = v; });
+  }
 
-  return videoIds.map((videoId) => {
-    const snippet = detailsById[videoId] || {};
+  return videoIds.filter((id) => detailsById[id]).map((videoId) => {
+    const v = detailsById[videoId];
+    const snippet = v.snippet || {};
+    const durationSeconds = parseIsoDuration(v.contentDetails?.duration);
+    const views = v.statistics?.viewCount;
     return {
       videoId,
       title: snippet.title || '',
       description: snippet.description || '',
       tags: snippet.tags || [],
       thumbnail: snippet.thumbnails?.medium?.url || snippet.thumbnails?.default?.url || '',
-      publishedAt: snippet.publishedAt || null
+      thumbnailHigh: snippet.thumbnails?.maxres?.url || snippet.thumbnails?.high?.url || snippet.thumbnails?.medium?.url || '',
+      publishedAt: snippet.publishedAt || null,
+      viewCount: views != null ? Number(views) : null,
+      durationSeconds,
+      isShort: durationSeconds > 0 && durationSeconds <= 180
     };
   });
 };
