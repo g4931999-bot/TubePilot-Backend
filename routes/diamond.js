@@ -10,11 +10,6 @@ const GiftCode = require('../models/GiftCode');
 const router = express.Router();
 
 // ⚠️ BOSS RULE (final): ANY paid pack — even ₹10 — unlocks full Video SEO
-// Optimizer copy/suggest access. Only a user who has NEVER purchased any
-// pack (seoScoreLevel stays 'none' at the User schema default) sees the
-// locked state there. Channel SEO Score is gated separately and more
-// strictly (only 'advance' / ₹100+ unlocks it — see routes/analytics.js
-// /audit route), even though it reads the SAME seoScoreLevel field.
 //   tier 1 (₹10)  → 1 thumbnail prompt,  SEO: basic,     Competitor: none
 //   tier 2 (₹50)  → 5 thumbnail prompts, SEO: basic,     Competitor: none
 //   tier 3 (₹100) → 10 thumbnail prompts,SEO: advance,   Competitor: basic
@@ -26,12 +21,6 @@ const DIAMOND_PACKAGES_BASE = [
   { tier: 4, diamonds: 799, priceINR: 200, thumbnailPrompts: 20, seoScoreLevel: 'advance', competitorLevel: 'advance' },
 ];
 
-// Builds the honest "What's included" list the Flutter Diamond Store
-// screen renders directly. Every package gets the SAME rows in the SAME
-// order, each with `included` true/false — so a lower tier visibly shows
-// what it's missing instead of silently listing features it doesn't grant.
-// Video SEO Optimizer line reflects the (basic-unlocks-too) rule; Channel
-// SEO Score line is called out separately since it needs 'advance'.
 const buildFeatureList = (pkg) => [
   { label: 'AI Title Generation', included: true },
   { label: 'AI Description Generation', included: true },
@@ -62,11 +51,7 @@ router.get('/packages', protect, (req, res) => {
 });
 
 /**
- * Shared "claim + credit" logic. Used by handleVerifyPayment (app poll),
- * the webhook, and the background auto-check job below — three different
- * triggers can all race to be the one that confirms a given order, so this
- * is the ONLY place that ever flips a transaction to 'approved' and
- * increments diamondBalance / replaces the user's plan fields.
+ * Shared "claim + credit" logic.
  */
 const creditApprovedTransaction = async (transactionId, source) => {
   const claimed = await Transaction.findOneAndUpdate(
@@ -124,7 +109,9 @@ const handleCreateOrder = async (req, res) => {
     }
 
     const userIdentifier = req.user.userId || req.user._id.toString().slice(-6);
-    const orderId = `TP${userIdentifier}_${Date.now()}`;
+    // ✅ FIXED: Clean orderId, no double TP, alphanumeric only
+    const cleanUserId = String(userIdentifier).replace(/[^a-zA-Z0-9]/g, '').slice(-6);
+    const orderId = `TP${cleanUserId}${Date.now()}`;
 
     const transaction = await Transaction.create({
       user: req.user._id,
@@ -141,32 +128,43 @@ const handleCreateOrder = async (req, res) => {
       cashfreeOrderId: orderId
     });
 
-    const order = await createCashfreeOrder({
-      orderId,
-      amount: pkg.priceINR,
-      customerId: userIdentifier,
-      customerPhone: req.user.phone,
-      customerEmail: req.user.email,
-      customerName: req.user.name
-    });
+    try {
+      const order = await createCashfreeOrder({
+        orderId,
+        amount: pkg.priceINR,
+        customerId: userIdentifier,
+        customerPhone: req.user.phone,
+        customerEmail: req.user.email,
+        customerName: req.user.name
+      });
 
-    transaction.paymentSessionId = order.paymentSessionId;
-    await transaction.save();
+      transaction.paymentSessionId = order.paymentSessionId;
+      transaction.cfOrderId = order.cfOrderId; // Save for reference
+      await transaction.save();
 
-    console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${orderId}, amount=₹${pkg.priceINR}, diamonds=${pkg.diamonds}, tier=${pkg.tier}`);
+      console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${order.orderId}, cfOrder=${order.cfOrderId}, amount=₹${pkg.priceINR}`);
 
-    res.status(201).json({
-      success: true,
-      orderId: order.orderId,
-      paymentSessionId: order.paymentSessionId,
-      transactionId: transaction._id
-    });
+      return res.status(201).json({
+        success: true,
+        orderId: order.orderId,
+        paymentSessionId: order.paymentSessionId,
+        transactionId: transaction._id
+      });
+
+    } catch (cfErr) {
+      // If Cashfree fails, delete the pending transaction we just created - don't leave fake orders
+      await Transaction.findByIdAndDelete(transaction._id);
+      throw cfErr;
+    }
+
   } catch (err) {
     if (err.code === 'CASHFREE_NOT_CONFIGURED') {
       return res.status(503).json({ success: false, message: err.message, code: err.code });
     }
     console.error('❌ [Cashfree] create-order failed:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: 'Could not start payment. Please try again.' });
+    // Send exact Cashfree message to Flutter for debugging
+    const cfMsg = err.response?.data?.message || err.message;
+    res.status(500).json({ success: false, message: `Could not start payment: ${cfMsg}` });
   }
 };
 
@@ -182,40 +180,57 @@ const handleVerifyPayment = async (req, res) => {
       return res.json({ success: true, status: 'approved', message: 'Payment already confirmed', transaction });
     }
 
-    const cfOrder = await getCashfreeOrderStatus(orderId);
-    console.log(`💳 [Cashfree] Verify — order ${orderId}: status=${cfOrder.order_status}`);
+    if (transaction.status === 'rejected') {
+      return res.json({ success: true, status: 'rejected', message: 'Payment was rejected', transaction });
+    }
 
-    if (cfOrder.order_status === 'PAID') {
-      const result = await creditApprovedTransaction(transaction._id, 'Cashfree');
+    try {
+      const cfOrder = await getCashfreeOrderStatus(orderId);
+      console.log(`💳 [Cashfree] Verify — order ${orderId}: status=${cfOrder.order_status}`);
 
-      if (!result) {
-        const current = await Transaction.findById(transaction._id);
+      if (cfOrder.order_status === 'PAID') {
+        const result = await creditApprovedTransaction(transaction._id, 'Cashfree Verify');
+        if (!result) {
+          const current = await Transaction.findById(transaction._id);
+          return res.json({
+            success: true,
+            status: current.status,
+            message: current.status === 'approved' ? 'Payment already confirmed' : 'Payment not completed yet',
+            transaction: current
+          });
+        }
+        console.log(`✅ [Cashfree] Order ${orderId}: PAID — credited ${result.claimed.diamondPackage} diamonds`);
         return res.json({
           success: true,
-          status: current.status,
-          message: current.status === 'approved' ? 'Payment already confirmed' : 'Payment not completed yet',
-          transaction: current
+          status: 'approved',
+          message: 'Payment confirmed, diamonds credited',
+          transaction: result.claimed,
+          diamondBalance: result.updatedUser?.diamondBalance
         });
       }
 
-      console.log(`✅ [Cashfree] Order ${orderId}: PAID — credited ${result.claimed.diamondPackage} diamonds to user ${req.user._id}`);
-      return res.json({
-        success: true,
-        status: 'approved',
-        message: 'Payment confirmed, diamonds credited',
-        transaction: result.claimed,
-        diamondBalance: result.updatedUser?.diamondBalance
-      });
+      if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
+        transaction.status = 'rejected';
+        transaction.adminNote = `Cashfree order status: ${cfOrder.order_status}`;
+        await transaction.save();
+        return res.json({ success: true, status: 'rejected', message: 'Payment was not completed', transaction });
+      }
+
+      return res.json({ success: true, status: 'pending', message: 'Payment not completed yet', transaction, cfStatus: cfOrder.order_status });
+
+    } catch (cfErr) {
+      // ✅ FIXED: Handle order_not_found gracefully
+      const cfData = cfErr.response?.data;
+      if (cfData?.code === 'order_not_found') {
+        console.warn(`⚠️ [Cashfree] Verify: Order ${orderId} not found on Cashfree - marking rejected`);
+        transaction.status = 'rejected';
+        transaction.adminNote = 'Order not found on Cashfree - never created (old invalid params)';
+        await transaction.save();
+        return res.json({ success: true, status: 'rejected', message: 'Order expired or not found', transaction });
+      }
+      throw cfErr;
     }
 
-    if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
-      transaction.status = 'rejected';
-      transaction.adminNote = `Cashfree order status: ${cfOrder.order_status}`;
-      await transaction.save();
-      return res.json({ success: true, status: 'rejected', message: 'Payment was not completed', transaction });
-    }
-
-    return res.json({ success: true, status: 'pending', message: 'Payment not completed yet', transaction });
   } catch (err) {
     console.error('❌ [Cashfree] verify-payment failed:', err.response?.data || err.message);
     res.status(500).json({ success: false, message: 'Could not verify payment. Please check My Requests or contact support.' });
@@ -229,18 +244,13 @@ router.post('/buy', protect, handleCreateOrder);
 router.post('/verify-payment', protect, handleVerifyPayment);
 router.post('/verify', protect, handleVerifyPayment);
 
+// New public verify page - used as return_url target
 router.get('/verify', (req, res) => {
+  const orderId = req.query.order_id || req.query.orderId || '';
   res.status(200).send(`<!DOCTYPE html>
-<html>
-  <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Payment Received</title>
-  </head>
-  <body style="font-family:sans-serif;text-align:center;padding-top:60px;color:#222;">
-    <h2>✅ Payment received</h2>
-    <p>You can close this window and return to the app.</p>
-  </body>
-</html>`);
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Payment Received</title>
+<style>body{font-family:sans-serif;text-align:center;padding-top:60px;color:#222;background:#fafafa} .card{max-width:400px;margin:20px auto;background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.06)}</style></head>
+<body><div class="card"><h2>✅ Payment received</h2><p>Order: ${orderId}</p><p>You can close this window and return to the app.</p><p style="color:#888;font-size:12px">Diamonds will be credited automatically.</p></div></body></html>`);
 });
 
 router.post('/webhook', async (req, res) => {
@@ -253,15 +263,31 @@ router.post('/webhook', async (req, res) => {
       return res.status(200).json({ success: true });
     }
 
-    const cfOrder = await getCashfreeOrderStatus(orderId);
-    console.log(`💳 [Cashfree Webhook] Order ${orderId}: status=${cfOrder.order_status}`);
+    try {
+      const cfOrder = await getCashfreeOrderStatus(orderId);
+      console.log(`💳 [Cashfree Webhook] Order ${orderId}: status=${cfOrder.order_status}`);
 
-    if (cfOrder.order_status === 'PAID') {
-      const result = await creditApprovedTransaction(transaction._id, 'Cashfree webhook');
-      if (result) {
-        console.log(`✅ [Cashfree Webhook] Order ${orderId}: PAID — credited ${result.claimed.diamondPackage} diamonds to user ${result.claimed.user}`);
+      if (cfOrder.order_status === 'PAID') {
+        const result = await creditApprovedTransaction(transaction._id, 'Cashfree webhook');
+        if (result) {
+          console.log(`✅ [Cashfree Webhook] Order ${orderId}: PAID — credited ${result.claimed.diamondPackage} diamonds`);
+        }
+      } else if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
+        await Transaction.findOneAndUpdate(
+          { _id: transaction._id, status: 'pending' },
+          { $set: { status: 'rejected', adminNote: `Webhook: ${cfOrder.order_status}` } }
+        );
+      }
+    } catch (cfErr) {
+      const cfData = cfErr.response?.data;
+      if (cfData?.code === 'order_not_found') {
+        console.warn(`⚠️ [Cashfree Webhook] Order ${orderId} not found - marking rejected`);
+        await Transaction.findOneAndUpdate(
+          { _id: transaction._id, status: 'pending' },
+          { $set: { status: 'rejected', adminNote: 'Webhook: order not found on Cashfree' } }
+        );
       } else {
-        console.log(`ℹ️ [Cashfree Webhook] Order ${orderId}: already claimed/processed by another request — skipping duplicate credit`);
+        throw cfErr;
       }
     }
 
@@ -358,16 +384,30 @@ async function autoCheckPendingOrders() {
             if (cfOrder.order_status === 'PAID') {
               const result = await creditApprovedTransaction(transaction._id, 'auto-check job');
               if (result) {
-                console.log(`✅ [Cashfree AutoCheck] order ${transaction.cashfreeOrderId}: PAID — credited ${result.claimed.diamondPackage} diamonds to user ${result.claimed.user}`);
+                console.log(`✅ [Cashfree AutoCheck] order ${transaction.cashfreeOrderId}: PAID — credited ${result.claimed.diamondPackage} diamonds`);
               }
             } else if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
               await Transaction.findOneAndUpdate(
                 { _id: transaction._id, status: 'pending' },
                 { $set: { status: 'rejected', adminNote: `Cashfree order status: ${cfOrder.order_status} (auto-check job)` } }
               );
+              console.log(`❌ [AutoCheck] order ${transaction.cashfreeOrderId} marked rejected: ${cfOrder.order_status}`);
+            } else {
+              console.log(`ℹ️ [AutoCheck] order ${transaction.cashfreeOrderId}: ${cfOrder.order_status} - waiting`);
             }
+
           } catch (err) {
-            console.error(`❌ [Cashfree AutoCheck] order ${transaction.cashfreeOrderId} check failed:`, err.response?.data || err.message);
+            const cfData = err.response?.data;
+            // ✅ FIXED: Clean up fake orders that were never created on Cashfree
+            if (cfData?.code === 'order_not_found') {
+              await Transaction.findOneAndUpdate(
+                { _id: transaction._id, status: 'pending' },
+                { $set: { status: 'rejected', adminNote: 'Auto-clean: Order not found on Cashfree (created with invalid params before fix)' } }
+              );
+              console.log(`🗑️ [AutoCheck] Cleaned fake order ${transaction.cashfreeOrderId} - not found on Cashfree`);
+            } else {
+              console.error(`❌ [Cashfree AutoCheck] order ${transaction.cashfreeOrderId} check failed:`, cfData || err.message);
+            }
           }
         }));
 
@@ -377,10 +417,15 @@ async function autoCheckPendingOrders() {
       }
     }
 
-    await Transaction.updateMany(
+    // Auto-expire old pending
+    const expired = await Transaction.updateMany(
       { type: 'diamond_purchase', status: 'pending', paymentMethod: 'cashfree', createdAt: { $lt: cutoff } },
       { $set: { status: 'rejected', adminNote: `Auto-expired — no payment confirmation within ${AUTO_CHECK_MAX_AGE_HOURS}h` } }
     );
+    if (expired.modifiedCount > 0) {
+      console.log(`🗑️ [AutoCheck] Auto-expired ${expired.modifiedCount} old pending orders`);
+    }
+
   } catch (err) {
     console.error('❌ [Cashfree AutoCheck] job run failed:', err.response?.data || err.message);
   } finally {
