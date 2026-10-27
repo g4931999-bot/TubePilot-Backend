@@ -17,6 +17,8 @@ const {
   getISTDayRangeUTC
 } = require('../utils/dateHelpers');
 
+const { getBestTimeProfile, pickAutoSlots } = require('../utils/bestTimes');
+
 const router = express.Router();
 
 const DIAMOND_COST_PER_UPLOAD = Number(process.env.DIAMOND_COST_PER_UPLOAD || 10);
@@ -106,6 +108,14 @@ const assertDailyLimitOk = async (user, dateStr, excludeVideoId = null) => {
   }
 };
 
+// UPDATE16 - Auto-Slotting helpers. The user-level switch (User.autoSlotting) must be ON
+// AND the request must say it is a scheduled upload in auto mode (autoSlot=true),
+// so "Live" uploads are never moved.
+const autoSlotPickDeps = (user) => ({
+  dailyLimit: getUserDailyPostLimit(user),
+  countOnDate: (dateStr) => countUserVideosOnISTDate(user._id, dateStr)
+});
+
 // Local, read-only token-freshness check — same duplicated pattern used in
 // routes/analytics.js (cron/scheduler.js's internal helper isn't exported).
 const ensureFreshTokenForVideos = async (user) => {
@@ -148,22 +158,45 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     const perPlatformMeta = {};
     const scheduledDates = [];
 
+    // UPDATE16: Auto-Slotting ON -> publish at the user's best real time.
+    // Falls back to the manually picked time if there is not enough YouTube data yet;
+    // if there is no manual time either we refuse (never silently publish "live").
+    let autoSlotAt = null;
+    const wantsAuto = user.autoSlotting === true && req.body.autoSlot === 'true';
+    if (wantsAuto) {
+      const profile = await getBestTimeProfile(user);
+      if (profile) {
+        const picked = await pickAutoSlots(profile, 1, autoSlotPickDeps(user));
+        if (picked) autoSlotAt = picked[0];
+      }
+      if (!autoSlotAt) {
+        const hasManual = ['youtube', 'facebook', 'instagram'].some((k) => parseJson(req.body[k], {}).scheduledAt);
+        if (!hasManual) {
+          return res.status(400).json({
+            success: false,
+            code: 'AUTO_SLOT_UNAVAILABLE',
+            message: 'Auto-Slotting needs at least 5 published videos (older than 2 days) on your channel to find your best time. Pick a time manually or turn Auto-Slotting off.'
+          });
+        }
+      }
+    }
+
     for (const p of platformsRequested) {
       if (p === 'youtube') {
         const yt = parseJson(req.body.youtube, {});
-        const scheduledAt = yt.scheduledAt ? new Date(yt.scheduledAt) : null;
+        const scheduledAt = autoSlotAt || (yt.scheduledAt ? new Date(yt.scheduledAt) : null);
         assertScheduleBufferOk(scheduledAt);
         perPlatformMeta.youtube = { raw: yt, scheduledAt };
         scheduledDates.push(scheduledAt);
       } else if (p === 'facebook') {
         const fb = parseJson(req.body.facebook, {});
-        const scheduledAt = fb.scheduledAt ? new Date(fb.scheduledAt) : null;
+        const scheduledAt = autoSlotAt || (fb.scheduledAt ? new Date(fb.scheduledAt) : null);
         assertScheduleBufferOk(scheduledAt);
         perPlatformMeta.facebook = { raw: fb, scheduledAt };
         scheduledDates.push(scheduledAt);
       } else if (p === 'instagram') {
         const ig = parseJson(req.body.instagram, {});
-        const scheduledAt = ig.scheduledAt ? new Date(ig.scheduledAt) : null;
+        const scheduledAt = autoSlotAt || (ig.scheduledAt ? new Date(ig.scheduledAt) : null);
         assertScheduleBufferOk(scheduledAt);
         perPlatformMeta.instagram = { raw: ig, scheduledAt };
         scheduledDates.push(scheduledAt);
@@ -258,7 +291,7 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     user.storageUsedBytes += videoFile.size;
     await user.save();
 
-    res.status(201).json({ success: true, video });
+    res.status(201).json({ success: true, video, autoSlotted: !!autoSlotAt, autoSlotAt });
   } catch (err) {
     if (err.code === 'INSUFFICIENT_DIAMONDS') {
       sendOneSignalToUser(req.user, {
@@ -316,12 +349,23 @@ router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res
       });
     }
 
+    // UPDATE16: Auto-Slotting ON -> every video goes to the user's best real time on the
+    // next days with room (today skipped, same as before). No data yet -> old behaviour
+    // (preferredTime) so the batch still works.
+    let autoTimes = null;
+    let autoSlotNote = '';
+    if (user.autoSlotting === true && req.body.autoSlot === 'true') {
+      const profile = await getBestTimeProfile(user);
+      if (profile) autoTimes = await pickAutoSlots(profile, files.length, { ...autoSlotPickDeps(user), startOffsetDays: 1 });
+      if (!autoTimes) autoSlotNote = ' Auto-Slotting could not find your best times yet (needs 5+ published videos older than 2 days), so the preferred time was used.';
+    }
+
     const dailyLimit = getUserDailyPostLimit(user);
     let cursorDateStr = addDaysToDateStr(getCurrentISTDateStr(), 1);
     const slotDateStrs = [];
     const assignedCountByDate = {};
     let safetyCounter = 0;
-    while (slotDateStrs.length < files.length) {
+    while (!autoTimes && slotDateStrs.length < files.length) {
       safetyCounter += 1;
       if (safetyCounter > files.length + 400) {
         return res.status(500).json({ success: false, message: 'Could not compute bulk schedule slots — please try a smaller batch.' });
@@ -340,8 +384,8 @@ router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res
     const results = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const dateStr = slotDateStrs[i];
-      const scheduledAt = buildISTInstant(dateStr, preferredTime);
+      const scheduledAt = autoTimes ? autoTimes[i] : buildISTInstant(slotDateStrs[i], preferredTime);
+      const dateStr = autoTimes ? toISTDateStr(scheduledAt) : slotDateStrs[i];
       const meta = items[i] || {};
 
       try {
@@ -414,7 +458,8 @@ router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res
 
     res.status(201).json({
       success: successCount > 0,
-      message: `${successCount}/${files.length} video(s) scheduled successfully, starting ${slotDateStrs[0]} (today skipped, ${dailyLimit}/day plan limit applied).`,
+      message: `${successCount}/${files.length} video(s) scheduled successfully, starting ${autoTimes ? toISTDateStr(autoTimes[0]) : slotDateStrs[0]} (today skipped, ${dailyLimit}/day plan limit applied${autoTimes ? ', best times auto-picked' : ''}).${autoSlotNote}`,
+      autoSlotted: !!autoTimes,
       results
     });
   } catch (err) {
@@ -491,6 +536,45 @@ router.get('/library', protect, async (req, res) => {
     items.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 
     res.json({ success: true, videos: items });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// UPDATE16 - Smart Scheduler Auto-Slotting switch. Registered ABOVE '/:id'.
+// GET   /api/videos/auto-slotting -> { enabled, nextSlot (ISO|null), videosUsed, reason }
+// PATCH /api/videos/auto-slotting { enabled: bool }
+router.get('/auto-slotting', protect, async (req, res) => {
+  try {
+    let nextSlot = null;
+    let videosUsed = 0;
+    let reason = '';
+    if (!req.user.youtubeChannel) {
+      reason = 'youtube_not_connected';
+    } else {
+      const profile = await getBestTimeProfile(req.user);
+      if (!profile) {
+        reason = 'not_enough_data';
+      } else {
+        videosUsed = profile.videosUsed;
+        const picked = await pickAutoSlots(profile, 1, autoSlotPickDeps(req.user));
+        nextSlot = picked ? picked[0] : null;
+      }
+    }
+    res.json({ success: true, enabled: req.user.autoSlotting === true, nextSlot, videosUsed, reason });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.patch('/auto-slotting', protect, async (req, res) => {
+  try {
+    if (typeof req.body.enabled !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'enabled (true/false) is required' });
+    }
+    req.user.autoSlotting = req.body.enabled;
+    await req.user.save();
+    res.json({ success: true, enabled: req.user.autoSlotting });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
