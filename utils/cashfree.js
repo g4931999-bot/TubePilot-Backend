@@ -1,6 +1,5 @@
 const axios = require('axios');
 
-// ENV setup - default PRODUCTION
 const CASHFREE_ENV = (process.env.CASHFREE_ENV || 'PRODUCTION').toUpperCase();
 const IS_PROD = CASHFREE_ENV === 'PRODUCTION' || CASHFREE_ENV === 'PROD';
 const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID;
@@ -18,13 +17,7 @@ if (!CASHFREE_APP_ID || !CASHFREE_SECRET_KEY) {
   console.warn('⚠️ [Cashfree] CASHFREE_APP_ID / SECRET_KEY missing in .env');
 }
 
-if (!process.env.APP_BASE_URL) {
-  console.warn(
-    '⚠️ [Cashfree] APP_BASE_URL not set - using fallback https://api.tubepilot.shop. Set APP_BASE_URL in .env'
-  );
-}
-
-console.log(`💳 [Cashfree] ENV=${CASHFREE_ENV} | Base=${BASE_URL} | Configured=${isConfigured} | ReturnBase=${APP_BASE_URL}`);
+console.log(`💳 [Cashfree] ENV=${CASHFREE_ENV} | Base=${BASE_URL} | Configured=${isConfigured}`);
 
 const cashfreeHeaders = () => ({
   'x-client-id': CASHFREE_APP_ID,
@@ -38,11 +31,9 @@ const formatPhoneNumber = (phoneStr) => {
   const cleaned = String(phoneStr).replace(/\D/g, '');
   if (cleaned.length === 10) return cleaned;
   if (cleaned.length > 10) return cleaned.slice(-10);
-  // If less than 10 digits, fallback to dummy but valid number
   return '9999999999';
 };
 
-// Sanitize order_id - Cashfree only allows alphanumeric, underscore, hyphen, max 40 chars
 const sanitizeOrderId = (orderId) => {
   let clean = String(orderId).replace(/[^a-zA-Z0-9_-]/g, '').substring(0, 40);
   if (clean.length < 4) clean = `TP${Date.now()}`;
@@ -53,10 +44,6 @@ const sanitizeCustomerId = (id) => {
   return String(id).replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50) || `user_${Date.now()}`;
 };
 
-/**
- * Creates a Cashfree Order - PRODUCTION READY
- * Docs: https://www.cashfree.com/docs/api-reference/payments/previous/v2023-08-01/orders/create.md
- */
 const createCashfreeOrder = async ({
   orderId,
   amount,
@@ -67,7 +54,7 @@ const createCashfreeOrder = async ({
   returnUrl
 }) => {
   if (!isConfigured) {
-    const err = new Error('Cashfree credentials missing. Set CASHFREE_APP_ID and CASHFREE_SECRET_KEY in .env');
+    const err = new Error('Cashfree credentials missing');
     err.code = 'CASHFREE_NOT_CONFIGURED';
     throw err;
   }
@@ -79,20 +66,19 @@ const createCashfreeOrder = async ({
     ? String(customerEmail).trim().toLowerCase()
     : `user_${cleanCustomerId}@tubepilot.shop`;
   const cleanName = (customerName || 'TubePilot User').substring(0, 100);
-
-  // Amount must be number, >=1, with max 2 decimals
   const cleanAmount = Number(Number(amount).toFixed(2));
+
   if (isNaN(cleanAmount) || cleanAmount < 1) {
-    throw new Error(`Invalid order amount: ${amount}`);
+    throw new Error(`Invalid amount: ${amount}`);
   }
 
-  // ✅ FIXED return_url - points to public page that exists and is whitelisted
-  // This is the URL user is redirected to after payment in browser
   const appReturnUrl = returnUrl || `${APP_BASE_URL}/payment/success?order_id={order_id}`;
-  
-  // notify_url for webhook - Cashfree will POST payment updates here (optional but recommended)
   const notifyUrl = `${APP_BASE_URL}/api/diamonds/webhook`;
 
+  // ✅ FIXED - payment_methods field REMOVED completely
+  // Cashfree will allow all enabled methods by default if not sent
+  // If you want to restrict, use only: cc,dc,upi,nb,app,ccc,ppc,emi,paylater
+  // wallet is INVALID - don't use it
   const payload = {
     order_id: cleanOrderId,
     order_amount: cleanAmount,
@@ -105,85 +91,66 @@ const createCashfreeOrder = async ({
     },
     order_meta: {
       return_url: appReturnUrl,
-      notify_url: notifyUrl,
-      payment_methods: "cc,dc,upi,nb,app,wallet" // All methods allowed
+      notify_url: notifyUrl
+      // payment_methods REMOVED - let Cashfree use dashboard config
     },
-    // Optional: order note for dashboard
-    order_note: `TubePilot Diamonds Purchase - ${cleanCustomerId}`
+    order_note: `TubePilot ${cleanAmount} INR - ${cleanCustomerId}`
   };
 
-  console.log(`💳 [Cashfree] Creating order: ${cleanOrderId} | Amount: ₹${cleanAmount} | Customer: ${cleanCustomerId}`);
+  console.log(`💳 [Cashfree] Creating: ${cleanOrderId} | ₹${cleanAmount} | ${cleanCustomerId}`);
 
   try {
     const res = await axios.post(`${BASE_URL}/orders`, payload, { 
       headers: cashfreeHeaders(),
-      timeout: 15000 // 15 sec timeout
+      timeout: 15000
     });
 
-    if (!res.data || !res.data.payment_session_id) {
-      console.error('❌ [Cashfree] No payment_session_id in response:', res.data);
-      throw new Error('Cashfree did not return payment_session_id');
+    if (!res.data?.payment_session_id) {
+      console.error('❌ No session_id in response:', res.data);
+      throw new Error('No payment_session_id');
     }
 
-    console.log(`✅ [Cashfree] Order created - OrderID: ${res.data.order_id} | CF_OrderID: ${res.data.cf_order_id}`);
+    console.log(`✅ Order OK: ${res.data.order_id} | CF: ${res.data.cf_order_id}`);
 
     return {
       orderId: res.data.order_id,
       paymentSessionId: res.data.payment_session_id,
-      cfOrderId: res.data.cf_order_id,
-      orderAmount: res.data.order_amount
+      cfOrderId: res.data.cf_order_id
     };
 
   } catch (err) {
     const cfError = err.response?.data;
-    console.error('❌ [Cashfree] create-order API failed:', {
+    console.error('❌ Create failed:', {
       orderId: cleanOrderId,
-      amount: cleanAmount,
       cfError: cfError || err.message,
       status: err.response?.status
     });
-
-    // Re-throw with proper details for routes/diamond.js to catch
     if (cfError) {
-      const error = new Error(cfError.message || 'Cashfree order creation failed');
-      error.response = { data: cfError };
-      error.statusCode = err.response?.status;
-      throw error;
+      const e = new Error(cfError.message || 'Cashfree failed');
+      e.response = { data: cfError };
+      throw e;
     }
     throw err;
   }
 };
 
-/**
- * Get Cashfree Order Status
- * Used for verify-payment poll
- */
 const getCashfreeOrderStatus = async (orderId) => {
-  if (!isConfigured) {
-    throw new Error('Cashfree credentials missing');
-  }
-
+  if (!isConfigured) throw new Error('Cashfree missing');
   const cleanOrderId = sanitizeOrderId(orderId);
-
   try {
     const res = await axios.get(`${BASE_URL}/orders/${cleanOrderId}`, { 
       headers: cashfreeHeaders(),
       timeout: 10000
     });
-    return res.data; // Contains order_status: PAID, ACTIVE, EXPIRED etc
+    return res.data;
   } catch (err) {
-    console.error(`❌ [Cashfree] get-order-status failed for ${cleanOrderId}:`, err.response?.data || err.message);
+    console.error(`❌ get-status ${cleanOrderId}:`, err.response?.data || err.message);
     throw err;
   }
 };
 
-/**
- * Get payments for an order - more detailed than get order
- */
 const getCashfreePaymentsForOrder = async (orderId) => {
-  if (!isConfigured) {
-    throw new Error('Cashfree credentials missing');
-  }
+  if (!isConfigured) throw new Error('Cashfree missing');
   const cleanOrderId = sanitizeOrderId(orderId);
   try {
     const res = await axios.get(`${BASE_URL}/orders/${cleanOrderId}/payments`, {
@@ -192,7 +159,7 @@ const getCashfreePaymentsForOrder = async (orderId) => {
     });
     return res.data;
   } catch (err) {
-    console.error(`❌ [Cashfree] get-payments failed for ${cleanOrderId}:`, err.response?.data || err.message);
+    console.error(`❌ get-payments ${cleanOrderId}:`, err.response?.data || err.message);
     throw err;
   }
 };
