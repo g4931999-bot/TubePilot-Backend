@@ -161,7 +161,9 @@ router.get('/my-videos', protect, async (req, res) => {
       return res.status(404).json({ success: false, message: 'No YouTube channel connected' });
     }
     const accessToken = await ensureFreshAccessToken(req.user);
-    const videos = await listChannelVideos(accessToken);
+    // UPDATE14: optional ?max=N (default 25, capped at 100) so the SEO / thumbnail screens can load more.
+    const max = Math.min(Math.max(parseInt(req.query.max, 10) || 25, 1), 100);
+    const videos = await listChannelVideos(accessToken, { maxResults: max });
     res.json({ success: true, videos });
   } catch (err) {
     if (isInvalidGrantError(err)) {
