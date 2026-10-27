@@ -122,6 +122,9 @@ const UserSchema = new mongoose.Schema({
   activeTier: { type: Number, default: 0 }, // 0 = no plan yet, 1..4 = package tier
   thumbnailPromptsRemaining: { type: Number, default: 0 },
   seoScoreLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
+  // UPDATE16: Smart Scheduler Auto-Slotting. ON = scheduled uploads are auto-placed at the user's
+  // best (real, YouTube-data based) time; OFF = the time the user picks manually is used.
+  autoSlotting: { type: Boolean, default: false },
   competitorLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
 
   // ⚠️ NEW: Live Streaming plan (day pass / monthly pass) — completely
