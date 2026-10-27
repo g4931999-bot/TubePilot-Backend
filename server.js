@@ -46,7 +46,7 @@ mongoose.connect(process.env.MONGODB_URI, {
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
-app.use('/api/diamonds', require('./routes/diamonds'));
+app.use('/api/diamonds', require('./routes/diamond'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/youtube', require('./routes/youtube'));
 app.use('/api/admin', require('./routes/admin'));
