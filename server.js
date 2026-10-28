@@ -23,7 +23,15 @@ const youtubeRoutes = require('./routes/youtube');
 const driveRoutes = require('./routes/drive');
 const metaRoutes = require('./routes/meta');
 const videoRoutes = require('./routes/video');
-const diamondRoutes = require('./routes/diamond');
+// UPDATE19: works whether the file is routes/diamonds.js or routes/diamond.js
+const fs = require('fs');
+const path = require('path');
+const diamondRoutes = fs.existsSync(path.join(__dirname, 'routes', 'diamonds.js'))
+  ? require('./routes/diamonds')
+  : require('./routes/diamond');
+// UPDATE19: single source of truth for the Cashfree environment (same value the app receives)
+const { CASHFREE_ENV } = require('./utils/cashfree');
+const APP_BASE = (process.env.APP_BASE_URL || process.env.PUBLIC_BACKEND_URL || 'https://api.tubepilot.shop').trim().replace(/\/+$/, '');
 const walletRoutes = require('./routes/wallet');
 const liveStreamRoutes = require('./routes/liveStream');
 const livePlansRoutes = require('./routes/livePlans');
@@ -177,7 +185,7 @@ app.use('/api/seed-admin', seedAdminRoute);
 
 app.use('/api/uploads', uploadsRoutes);
 
-if (require('fs').existsSync('./routes/posts.js')) {
+if (fs.existsSync(path.join(__dirname, 'routes', 'posts.js'))) {
   app.use('/api/posts', require('./routes/posts'));
 }
 
@@ -200,7 +208,7 @@ app.get('/', (req, res) => {
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TubePilot API - Live</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:#fafafa;color:#222}.container{max-width:800px;margin:0 auto;padding:40px 20px}.header{background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;padding:40px;border-radius:16px;text-align:center;margin-bottom:24px}.card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:16px}.badge{display:inline-block;background:#f3f0ff;color:#7c3aed;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:700}a{color:#7c3aed;text-decoration:none}</style></head>
 <body><div class="container"><div class="header"><h1>🚀 TubePilot API</h1><p>AI-Powered YouTube Growth Platform - Backend Live</p><span class="badge">● LIVE</span></div>
-<div class="card"><h3>✅ API Status: Operational</h3><p>DB: ${dbStatusText} (State: ${dbState})</p><p>Base: https://api.tubepilot.shop</p><p>Cashfree: ${process.env.CASHFREE_APP_ID ? '✅ Configured (' + (process.env.CASHFREE_ENV || 'SANDBOX') + ')' : '❌ Not Configured'}</p></div>
+<div class="card"><h3>✅ API Status: Operational</h3><p>DB: ${dbStatusText} (State: ${dbState})</p><p>Base: ${APP_BASE}</p><p>Cashfree: ${process.env.CASHFREE_APP_ID ? '✅ Configured (' + CASHFREE_ENV + ')' : '❌ Not Configured'}</p></div>
 <div class="card"><h3>📦 Services</h3><ul><li>💎 Diamond Store & Cashfree Payments</li><li>📊 YouTube Analytics & SEO</li><li>🤖 AI Title, Description, Thumbnails</li><li>📡 Live Stream Planning</li></ul></div>
 <div class="card"><h3>🔗 Links</h3><p><a href="/privacy">Privacy</a> | <a href="/terms">Terms</a> | <a href="/api/health">Health Check</a> | <a href="https://www.tubepilot.shop">Main Website</a></p></div></div></body></html>`);
 });
@@ -247,9 +255,9 @@ app.get('/api/health', (req, res) => res.json({
   status: 'healthy',
   message: 'TubePilot Production API is running smoothly',
   timestamp: new Date().toISOString(),
-  environment: process.env.CASHFREE_ENV || 'SANDBOX',
+  environment: CASHFREE_ENV,
   cashfree: process.env.CASHFREE_APP_ID ? 'configured' : 'not configured',
-  appBaseUrl: process.env.APP_BASE_URL || 'https://api.tubepilot.shop',
+  appBaseUrl: APP_BASE,
   mongo: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
   mongoState: mongoose.connection.readyState
 }));
@@ -275,8 +283,8 @@ const startServer = async () => {
     await connectDB();
     app.listen(PORT, () => {
       console.log(`🚀 TubePilot production backend live on port ${PORT}`);
-      console.log(`🌐 App Base URL: ${process.env.APP_BASE_URL || 'https://api.tubepilot.shop'}`);
-      console.log(`💳 Cashfree ENV: ${process.env.CASHFREE_ENV || 'SANDBOX'}`);
+      console.log(`🌐 App Base URL: ${APP_BASE}`);
+      console.log(`💳 Cashfree ENV: ${CASHFREE_ENV}`);
       console.log(`💳 Cashfree Configured: ${process.env.CASHFREE_APP_ID ? 'YES' : 'NO'}`);
       console.log(`💾 MongoDB State: ${mongoose.connection.readyState === 1 ? 'Connected' : 'Connecting...'}`);
       startPublishScheduler();
