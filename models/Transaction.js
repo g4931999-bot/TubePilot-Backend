@@ -4,7 +4,7 @@ const TransactionSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   userDisplayId: { type: String, required: true },
 
-  // ⚠️ NEW: 'live_plan_purchase' added for Day Pass / Monthly Pass buys.
+  // 'live_plan_purchase' added for Day Pass / Monthly Pass buys.
   type: {
     type: String,
     enum: ['diamond_purchase', 'diamond_spend', 'diamond_refund', 'live_plan_purchase'],
@@ -19,7 +19,7 @@ const TransactionSchema = new mongoose.Schema({
   seoScoreLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
   competitorLevel: { type: String, enum: ['none', 'basic', 'advance'], default: 'none' },
 
-  // ⚠️ NEW: Live Streaming plan snapshot at purchase time — same reasoning
+  // Live Streaming plan snapshot at purchase time — same reasoning
   // as planTier/seoScoreLevel above: keep it on the transaction itself so
   // it stays historically accurate even if LIVE_PLANS config changes later.
   livePlanCategory: { type: String, enum: ['day', 'month'], default: null },
@@ -29,7 +29,9 @@ const TransactionSchema = new mongoose.Schema({
   diamondsForSpend: { type: Number, default: 0 },
   relatedVideo: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null },
 
-  paymentMethod: { type: String, enum: ['cashfree'], default: 'cashfree' },
+  // 'payu' added for the Diamond Store. Live Plans still uses 'cashfree' for now.
+  paymentMethod: { type: String, enum: ['cashfree', 'payu'], default: 'cashfree' },
+  // NOTE: for PayU orders this field holds the PayU txnid (kept to avoid a schema migration).
   cashfreeOrderId: { type: String, default: null, index: true },
   paymentSessionId: { type: String, default: null },
 
