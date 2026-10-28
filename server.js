@@ -23,14 +23,15 @@ const youtubeRoutes = require('./routes/youtube');
 const driveRoutes = require('./routes/drive');
 const metaRoutes = require('./routes/meta');
 const videoRoutes = require('./routes/video');
-// UPDATE19: works whether the file is routes/diamonds.js or routes/diamond.js
+// Works whether the file is routes/diamonds.js or routes/diamond.js
 const fs = require('fs');
 const path = require('path');
 const diamondRoutes = fs.existsSync(path.join(__dirname, 'routes', 'diamonds.js'))
   ? require('./routes/diamonds')
   : require('./routes/diamond');
-// UPDATE19: single source of truth for the Cashfree environment (same value the app receives)
-const { CASHFREE_ENV } = require('./utils/cashfree');
+// PayU: single source of truth for the payment environment
+const { IS_PROD: PAYU_IS_PROD, isConfigured: PAYU_CONFIGURED } = require('./utils/payu');
+const PAYU_ENV = PAYU_IS_PROD ? 'PRODUCTION' : 'TEST';
 const APP_BASE = (process.env.APP_BASE_URL || process.env.PUBLIC_BACKEND_URL || 'https://api.tubepilot.shop').trim().replace(/\/+$/, '');
 const walletRoutes = require('./routes/wallet');
 const liveStreamRoutes = require('./routes/liveStream');
@@ -48,7 +49,7 @@ const milestoneRoutes = require('./routes/milestones');
 const app = express();
 
 // -----------------------------------------------------------------------
-// ⚠️ NEW: process-level safety nets
+// Process-level safety nets
 // -----------------------------------------------------------------------
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ [Unhandled Rejection]', reason && reason.stack ? reason.stack : reason);
@@ -95,6 +96,7 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '15mb' }));
+// PayU surl/furl + webhook arrive as application/x-www-form-urlencoded
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(cookieParser());
 
@@ -167,6 +169,7 @@ app.use('/api/video', videoRoutes);
 app.use('/api/live-stream', liveStreamRoutes);
 app.use('/api/live-plans', livePlansRoutes);
 
+// Diamond Store (PayU): /api/payment/payu/webhook and /api/payment/payu/result live in this router
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
@@ -189,16 +192,13 @@ if (fs.existsSync(path.join(__dirname, 'routes', 'posts.js'))) {
   app.use('/api/posts', require('./routes/posts'));
 }
 
-// ================== PUBLIC PAGES FOR CASHFREE BOT & PAYMENT ==================
+// ================== PUBLIC PAGES (payment gateway review & landing) ==================
 
-// Landing page - Cashfree bot checks this
 app.get('/landing', (req, res) => {
   res.redirect('/');
 });
 
 app.get('/', (req, res) => {
-  // Don't interfere with share route - if path is exactly / and share route already handled, this will still work
-  // Check if this is API base request (no share slug)
   if (req.query.slug || req.path.length > 1) {
     return res.status(404).send('Not found');
   }
@@ -208,55 +208,46 @@ app.get('/', (req, res) => {
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TubePilot API - Live</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:#fafafa;color:#222}.container{max-width:800px;margin:0 auto;padding:40px 20px}.header{background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;padding:40px;border-radius:16px;text-align:center;margin-bottom:24px}.card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:16px}.badge{display:inline-block;background:#f3f0ff;color:#7c3aed;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:700}a{color:#7c3aed;text-decoration:none}</style></head>
 <body><div class="container"><div class="header"><h1>🚀 TubePilot API</h1><p>AI-Powered YouTube Growth Platform - Backend Live</p><span class="badge">● LIVE</span></div>
-<div class="card"><h3>✅ API Status: Operational</h3><p>DB: ${dbStatusText} (State: ${dbState})</p><p>Base: ${APP_BASE}</p><p>Cashfree: ${process.env.CASHFREE_APP_ID ? '✅ Configured (' + CASHFREE_ENV + ')' : '❌ Not Configured'}</p></div>
-<div class="card"><h3>📦 Services</h3><ul><li>💎 Diamond Store & Cashfree Payments</li><li>📊 YouTube Analytics & SEO</li><li>🤖 AI Title, Description, Thumbnails</li><li>📡 Live Stream Planning</li></ul></div>
+<div class="card"><h3>✅ API Status: Operational</h3><p>DB: ${dbStatusText} (State: ${dbState})</p><p>Base: ${APP_BASE}</p><p>PayU: ${PAYU_CONFIGURED ? '✅ Configured (' + PAYU_ENV + ')' : '❌ Not Configured'}</p></div>
+<div class="card"><h3>📦 Services</h3><ul><li>💎 Diamond Store & PayU Payments</li><li>📊 YouTube Analytics & SEO</li><li>🤖 AI Title, Description, Thumbnails</li><li>📡 Live Stream Planning</li></ul></div>
 <div class="card"><h3>🔗 Links</h3><p><a href="/privacy">Privacy</a> | <a href="/terms">Terms</a> | <a href="/api/health">Health Check</a> | <a href="https://www.tubepilot.shop">Main Website</a></p></div></div></body></html>`);
 });
 
 app.get('/privacy', (req, res) => {
-  res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Privacy - TubePilot</title><style>body{font-family:sans-serif;max-width:800px;margin:0 auto;padding:20px;line-height:1.6;color:#222}</style></head><body><h1>Privacy Policy</h1><p>Last updated: Jan 2025</p><p>TubePilot respects your privacy. We collect only necessary data for YouTube growth tools. Payment data is handled securely by Cashfree Payment Gateway.</p><p>Contact: support@tubepilot.shop</p><a href="/">← Back to Home</a></body></html>`);
+  res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Privacy - TubePilot</title><style>body{font-family:sans-serif;max-width:800px;margin:0 auto;padding:20px;line-height:1.6;color:#222}</style></head><body><h1>Privacy Policy</h1><p>Last updated: Jan 2025</p><p>TubePilot respects your privacy. We collect only necessary data for YouTube growth tools. Payment data is handled securely by PayU Payment Gateway.</p><p>Contact: support@tubepilot.shop</p><a href="/">← Back to Home</a></body></html>`);
 });
 
 app.get('/terms', (req, res) => {
-  res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Terms - TubePilot</title><style>body{font-family:sans-serif;max-width:800px;margin:0 auto;padding:20px;line-height:1.6;color:#222}</style></head><body><h1>Terms of Service</h1><p>Last updated: Jan 2025</p><p>By using TubePilot you agree to our terms. All payments processed via Cashfree, diamonds are non-refundable.</p><p>Contact: support@tubepilot.shop</p><a href="/">← Back to Home</a></body></html>`);
+  res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Terms - TubePilot</title><style>body{font-family:sans-serif;max-width:800px;margin:0 auto;padding:20px;line-height:1.6;color:#222}</style></head><body><h1>Terms of Service</h1><p>Last updated: Jan 2025</p><p>By using TubePilot you agree to our terms. All payments are processed via PayU, diamonds are non-refundable.</p><p>Contact: support@tubepilot.shop</p><a href="/">← Back to Home</a></body></html>`);
 });
 
-// ================== PAYMENT SUCCESS PAGES - MAIN FIX ==================
-// This is the MAIN return_url target for Cashfree - MUST be on api.tubepilot.shop
+// ================== PAYMENT SUCCESS PAGES ==================
 app.get('/payment/success', (req, res) => {
-  const orderId = req.query.order_id || req.query.orderId || req.query.orderID || '';
+  const orderId = req.query.order_id || req.query.orderId || req.query.orderID || req.query.txnid || '';
   const cleanOrderId = String(orderId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 50);
-  const displayOrderId = cleanOrderId || orderId || 'N/A';
+  const displayOrderId = cleanOrderId || 'N/A';
   res.status(200).send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Payment Received - TubePilot</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:#f8f7ff;color:#222;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{max-width:480px;width:100%;background:#fff;padding:32px;border-radius:16px;box-shadow:0 4px 24px rgba(124,58,237,.12);text-align:center}.icon{width:64px;height:64px;background:linear-gradient(135deg,#7c3aed,#a855f7);border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px;font-size:32px;color:#fff}h1{color:#7c3aed;margin:0 0 8px;font-size:24px}.order{font-size:13px;color:#666;background:#f5f3ff;padding:8px 12px;border-radius:8px;word-break:break-all;margin:16px 0}p{color:#555;line-height:1.5;font-size:14px}.btn{display:inline-block;background:#7c3aed;color:#fff;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;margin-top:16px}.info{background:#f8f7ff;padding:16px;border-radius:12px;text-align:left;margin:20px 0;font-size:13px}.info ol{margin:8px 0;padding-left:20px}</style></head>
 <body><div class="card"><div class="icon">✓</div><h1>Payment Received</h1><div class="order">Order ID: <strong>${displayOrderId}</strong></div><p>Your diamonds will be credited automatically. You can close this window and return to the app.</p><div class="info"><strong>If app didn't auto-verify:</strong><ol><li>Open TubePilot App</li><li>Go to Diamond Store > My Requests</li><li>Wait 1-2 minutes, auto-check will credit it</li></ol></div><a class="btn" href="https://www.tubepilot.shop">Back to Home</a><p style="font-size:11px;color:#aaa;margin-top:16px">support@tubepilot.shop | Order: ${displayOrderId}</p></div></body></html>`);
 });
 
 // Alias routes for frontend typo and alternative paths
-app.get('/diamonds/success', (req, res) => {
-  const orderId = req.query.order_id || req.query.orderId || '';
+const successAlias = (req, res) => {
+  const orderId = String(req.query.order_id || req.query.orderId || req.query.txnid || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 50);
   res.redirect(`/payment/success?order_id=${orderId}`);
-});
-app.get('/daimonds/success', (req, res) => {
-  const orderId = req.query.order_id || req.query.orderId || '';
-  res.redirect(`/payment/success?order_id=${orderId}`);
-});
-app.get('/diamond/success', (req, res) => {
-  const orderId = req.query.order_id || req.query.orderId || '';
-  res.redirect(`/payment/success?order_id=${orderId}`);
-});
-app.get('/payment/daimonds/success', (req, res) => {
-  const orderId = req.query.order_id || req.query.orderId || '';
-  res.redirect(`/payment/success?order_id=${orderId}`);
-});
+};
+app.get('/diamonds/success', successAlias);
+app.get('/daimonds/success', successAlias);
+app.get('/diamond/success', successAlias);
+app.get('/payment/daimonds/success', successAlias);
 
 app.get('/api/health', (req, res) => res.json({
   success: true,
   status: 'healthy',
   message: 'TubePilot Production API is running smoothly',
   timestamp: new Date().toISOString(),
-  environment: CASHFREE_ENV,
-  cashfree: process.env.CASHFREE_APP_ID ? 'configured' : 'not configured',
+  environment: PAYU_ENV,
+  payu: PAYU_CONFIGURED ? 'configured' : 'not configured',
   appBaseUrl: APP_BASE,
   mongo: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
   mongoState: mongoose.connection.readyState
@@ -284,8 +275,8 @@ const startServer = async () => {
     app.listen(PORT, () => {
       console.log(`🚀 TubePilot production backend live on port ${PORT}`);
       console.log(`🌐 App Base URL: ${APP_BASE}`);
-      console.log(`💳 Cashfree ENV: ${CASHFREE_ENV}`);
-      console.log(`💳 Cashfree Configured: ${process.env.CASHFREE_APP_ID ? 'YES' : 'NO'}`);
+      console.log(`💳 PayU ENV: ${PAYU_ENV}`);
+      console.log(`💳 PayU Configured: ${PAYU_CONFIGURED ? 'YES' : 'NO'}`);
       console.log(`💾 MongoDB State: ${mongoose.connection.readyState === 1 ? 'Connected' : 'Connecting...'}`);
       startPublishScheduler();
       startRetryScheduler();
