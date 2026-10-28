@@ -21,6 +21,16 @@ const logAiError = (routeName, err) => {
   if (err.stack) console.error(err.stack);
 };
 
+// ⚠️ NEW: Video SEO Optimizer features unlock for ANY paid pack
+// (seoScoreLevel !== 'none'). Same rule as /seo-score below.
+const hasSeoPlan = (user) => user.seoScoreLevel && user.seoScoreLevel !== 'none';
+
+const planUpgradeBody = {
+  success: false,
+  message: 'Video SEO Optimizer is not included in your current plan. Please upgrade from the Diamond Store.',
+  code: 'PLAN_UPGRADE_REQUIRED'
+};
+
 router.get('/debug-env', protect, (req, res) => {
   res.json({
     success: true,
@@ -48,8 +58,13 @@ router.post('/title', protect, async (req, res) => {
   }
 });
 
-router.post('/title-options', protect, async (req, res) => {
+// Shared handlers: the generic route (AI Title Generator screen, open to anyone
+// with diamonds) and the SEO route (Video SEO Optimizer, paid packs only) run
+// the exact same logic - the SEO route just checks the plan first.
+const handleTitleOptions = (routeName, requirePlan) => async (req, res) => {
   try {
+    if (requirePlan && !hasSeoPlan(req.user)) return res.status(402).json(planUpgradeBody);
+
     const { topic, count } = req.body;
     if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
 
@@ -57,11 +72,35 @@ router.post('/title-options', protect, async (req, res) => {
     const titles = await generateTitleOptions(topic, count);
     res.json({ success: true, titles, diamondsCharged: AI_FEATURE_COST.titleOptions, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
-    logAiError('title-options', err);
+    logAiError(routeName, err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
-});
+};
+
+const handleDescriptionOptions = (routeName, requirePlan) => async (req, res) => {
+  try {
+    if (requirePlan && !hasSeoPlan(req.user)) return res.status(402).json(planUpgradeBody);
+
+    const { topic, count } = req.body;
+    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
+
+    await chargeDiamonds(req.user, AI_FEATURE_COST.descriptionOptions);
+    const descriptions = await generateDescriptionOptions(topic, count);
+    res.json({ success: true, descriptions, diamondsCharged: AI_FEATURE_COST.descriptionOptions, remainingDiamonds: req.user.diamondBalance });
+  } catch (err) {
+    logAiError(routeName, err);
+    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
+    res.status(status).json({ success: false, message: err.message });
+  }
+};
+
+router.post('/title-options', protect, handleTitleOptions('title-options', false));
+router.post('/description-options', protect, handleDescriptionOptions('description-options', false));
+
+// ⚠️ NEW: Video SEO Optimizer versions - need ANY paid pack (seoScoreLevel !== 'none').
+router.post('/seo-title-options', protect, handleTitleOptions('seo-title-options', true));
+router.post('/seo-description-options', protect, handleDescriptionOptions('seo-description-options', true));
 
 router.post('/description', protect, async (req, res) => {
   try {
@@ -73,21 +112,6 @@ router.post('/description', protect, async (req, res) => {
     res.json({ success: true, description, diamondsCharged: AI_FEATURE_COST.description, remainingDiamonds: req.user.diamondBalance });
   } catch (err) {
     logAiError('description', err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
-});
-
-router.post('/description-options', protect, async (req, res) => {
-  try {
-    const { topic, count } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
-
-    await chargeDiamonds(req.user, AI_FEATURE_COST.descriptionOptions);
-    const descriptions = await generateDescriptionOptions(topic, count);
-    res.json({ success: true, descriptions, diamondsCharged: AI_FEATURE_COST.descriptionOptions, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('description-options', err);
     const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
     res.status(status).json({ success: false, message: err.message });
   }
@@ -170,9 +194,7 @@ router.post('/ideas', protect, async (req, res) => {
 // seoScoreLevel field.
 router.post('/seo-score', protect, async (req, res) => {
   try {
-    if (req.user.seoScoreLevel === 'none') {
-      return res.status(402).json({ success: false, message: 'Video SEO Optimizer is not included in your current plan. Please upgrade from the Diamond Store.', code: 'PLAN_UPGRADE_REQUIRED' });
-    }
+    if (!hasSeoPlan(req.user)) return res.status(402).json(planUpgradeBody);
 
     const { title, description, tags, platform = 'youtube' } = req.body;
     if (!title) return res.status(400).json({ success: false, message: 'title is required' });
