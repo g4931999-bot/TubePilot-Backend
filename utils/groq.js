@@ -13,7 +13,9 @@ const isFailoverWorthyError = (status, errText) => {
   return false;
 };
 
-const callChatCompletionOnce = async (url, apiKey, model, systemPrompt, userPrompt, { json = false, extraHeaders = {} } = {}) => {
+// ⚠️ UPDATED: `temperature` is now an option (default 0.7 for creative text).
+// SEO scoring passes a low value so the same video gets a stable score.
+const callChatCompletionOnce = async (url, apiKey, model, systemPrompt, userPrompt, { json = false, extraHeaders = {}, temperature = 0.7 } = {}) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25000);
   try {
@@ -30,7 +32,7 @@ const callChatCompletionOnce = async (url, apiKey, model, systemPrompt, userProm
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
-        temperature: 0.7,
+        temperature,
         ...(json ? { response_format: { type: 'json_object' } } : {})
       }),
       signal: controller.signal
@@ -103,9 +105,52 @@ const callGroqWithFailover = async (systemPrompt, userPrompt, options = {}) => {
 
 const callGroq = callGroqWithFailover;
 
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// Models sometimes wrap JSON in ```json fences or add a sentence around it.
+const parseJsonLoose = (raw) => {
+  const s = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  try {
+    return JSON.parse(s);
+  } catch (_) {
+    const a = s.indexOf('{');
+    const b = s.lastIndexOf('}');
+    if (a !== -1 && b > a) return JSON.parse(s.slice(a, b + 1));
+    throw new Error('not json');
+  }
+};
+
+const clamp100 = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
+
+const cleanStrings = (arr, max) =>
+  (Array.isArray(arr) ? arr : [])
+    .map((x) => (typeof x === 'string' ? x : x && (x.text || x.title || x.description)) || '')
+    .map((x) => String(x).trim())
+    .filter(Boolean)
+    .slice(0, max);
+
+const uniqueCI = (arr) => {
+  const seen = new Set();
+  return arr.filter((x) => {
+    const k = x.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+};
+
+const SAME_LANGUAGE_RULE =
+  'Write in the SAME language and script as the given topic (Hindi stays Hindi, Hinglish/Roman Hindi stays Hinglish, English stays English). ';
+
+// ---------------------------------------------------------------------------
+// Generators
+// ---------------------------------------------------------------------------
+
 const generateTitle = async (topic) => {
   const raw = await callGroq(
-    'You are a YouTube SEO expert. Reply with ONLY one catchy, click-worthy YouTube video title under 90 characters. No quotes, no extra text.',
+    'You are a YouTube SEO expert. ' + SAME_LANGUAGE_RULE + 'Reply with ONLY one catchy, click-worthy YouTube video title under 90 characters. No quotes, no extra text.',
     `Video topic: ${topic}`
   );
   return raw.replace(/^["']|["']$/g, '');
@@ -116,13 +161,15 @@ const generateTitleOptions = async (topic, count = 5) => {
   const raw = await callGroq(
     `You are a YouTube SEO expert. Generate exactly ${n} distinct, catchy, click-worthy YouTube video title options for the given topic — ` +
       'each under 90 characters, genuinely different angles/hooks from each other, not just reworded variants of the same phrase. ' +
+      SAME_LANGUAGE_RULE +
       'Reply with ONLY a JSON object: {"titles": [string]}. No markdown, no extra text.',
     `Video topic: ${topic}`,
     { json: true }
   );
   try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed.titles) ? parsed.titles.slice(0, n) : [];
+    const parsed = parseJsonLoose(raw);
+    const titles = uniqueCI(cleanStrings(parsed.titles, 8).map((t) => t.replace(/^["']|["']$/g, '')).filter((t) => t.length <= 100));
+    return titles.slice(0, n);
   } catch {
     throw new Error('AI provider returned a non-JSON response for title options');
   }
@@ -130,7 +177,7 @@ const generateTitleOptions = async (topic, count = 5) => {
 
 const generateDescription = async (topic) => {
   return callGroq(
-    'You are a YouTube SEO expert. Write a compelling, SEO-optimized YouTube video description (150-300 words) with a hook in the first two lines. Reply with ONLY the description text.',
+    'You are a YouTube SEO expert. ' + SAME_LANGUAGE_RULE + 'Write a compelling, SEO-optimized YouTube video description (150-300 words) with a hook in the first two lines. Reply with ONLY the description text.',
     `Video topic: ${topic}`
   );
 };
@@ -139,13 +186,15 @@ const generateDescriptionOptions = async (topic, count = 4) => {
   const n = Math.min(Math.max(Number(count) || 4, 3), 5);
   const raw = await callGroq(
     `You are a YouTube SEO expert. Generate exactly ${n} distinct SEO-optimized YouTube video description options (100-200 words each) for the ` +
-      'given topic, each with a different opening hook/angle from the others. Reply with ONLY a JSON object: {"descriptions": [string]}. No markdown, no extra text.',
+      'given topic, each with a different opening hook/angle from the others. ' +
+      SAME_LANGUAGE_RULE +
+      'Reply with ONLY a JSON object: {"descriptions": [string]}. No markdown, no extra text.',
     `Video topic: ${topic}`,
     { json: true }
   );
   try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed.descriptions) ? parsed.descriptions.slice(0, n) : [];
+    const parsed = parseJsonLoose(raw);
+    return cleanStrings(parsed.descriptions, n);
   } catch {
     throw new Error('AI provider returned a non-JSON response for description options');
   }
@@ -153,7 +202,7 @@ const generateDescriptionOptions = async (topic, count = 4) => {
 
 const generateTags = async (topic) => {
   const raw = await callGroq(
-    'You are a YouTube SEO expert. Reply with ONLY a comma-separated list of 15 relevant YouTube tags/hashtags for the given topic. No numbering, no extra text.',
+    'You are a YouTube SEO expert. ' + SAME_LANGUAGE_RULE + 'Reply with ONLY a comma-separated list of 15 relevant YouTube tags/hashtags for the given topic. No numbering, no extra text.',
     `Video topic: ${topic}`
   );
   return raw.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
@@ -209,14 +258,14 @@ const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
     { json: true }
   );
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = parseJsonLoose(raw);
     return Array.isArray(parsed.ideas)
       ? parsed.ideas.map((i) => ({
           title: i.title || '',
           hook: i.hook || '',
           description: i.description || '',
           script: i.script || '',
-          viralScore: Math.max(0, Math.min(100, Math.round(Number(i.viralScore) || 0)))
+          viralScore: clamp100(i.viralScore)
         }))
       : [];
   } catch {
@@ -224,57 +273,109 @@ const generateAiScript = async ({ niche, platform = 'youtube', count = 5 }) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Video SEO Optimizer scoring
+// ---------------------------------------------------------------------------
+
+// Real, countable facts about the video's text. The server counts these itself
+// (LLMs miscount characters) and hands them to the model, so "issues" quote
+// exact numbers and the hard caps below are based on facts, not guesses.
+const computeSeoFacts = ({ title, description, tags }) => {
+  const t = String(title || '').trim();
+  const d = String(description || '').trim();
+  const tg = (Array.isArray(tags) ? tags : []).map((x) => String(x).trim()).filter(Boolean);
+  return {
+    titleChars: [...t].length,
+    titleWords: t ? t.split(/\s+/).length : 0,
+    titleHasNumber: /\d/.test(t),
+    descChars: [...d].length,
+    descWords: d ? d.split(/\s+/).length : 0,
+    descHasLink: /https?:\/\//i.test(d),
+    descHashtags: (d.match(/#\w+/g) || []).length,
+    tagCount: tg.length,
+    tagChars: tg.join(',').length
+  };
+};
+
+// Overall = fixed weighted formula (never the model's own number), so the big
+// ring always agrees with the three sub-scores shown under it.
+const SEO_WEIGHTS = { title: 0.4, desc: 0.3, tags: 0.3 };
+
 // Accepts `mode` ('basic' | 'advance'). Real prompt-depth difference, not
-// just a gate on top of the same output. Both modes now ask for an
-// "issues" array — 3-6 SPECIFIC problems with THIS exact title/description
-// /tags (not generic advice) — since Video SEO Optimizer unlocks for ANY
-// paid pack (mode is never 'none' when this is called from that route), so
-// "what's wrong with this video" needs to work at both basic and advance.
-// Only the deeper fields (recommendedTags / notes / competitorGapNotes)
-// stay advance-only.
+// just a gate on top of the same output. Both modes return per-area issues
+// (title / description / tags) — Video SEO Optimizer unlocks for ANY paid
+// pack. Only the deeper fields (recommendedTags / notes / competitorGapNotes)
+// stay advance-only; for basic they are returned EMPTY by the server, so a
+// basic user can never see them even by tampering with the app.
 const analyzeSeoScore = async ({ title, description, tags = [], platform = 'youtube', mode = 'advance' }) => {
+  const facts = computeSeoFacts({ title, description, tags });
+
+  const shared =
+    'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
+    'tagScore weighs relevance and coverage breadth (8-15 relevant tags ideal). ' +
+    '"issuesByArea" lists SPECIFIC problems with THIS exact title/description/tags — 1-3 per area, quoting the real numbers from the FACTS line (never generic tips, never recount the numbers yourself). ' +
+    'Use an empty array for an area that has no real problem. Write the issues in the same language as the title. No markdown, no extra text.';
+
   const basicSystemPrompt =
     `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags at a high level, and list concrete problems with them. ` +
-    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "issues": [string]}. ' +
-    'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
-    'tagScore weighs relevance and coverage breadth. "issues" is 3-6 SPECIFIC problems with THIS exact title/description/tags (e.g. exact char counts, missing hook, too few tags) — not generic tips. No markdown, no extra text.';
+    'Reply with ONLY a JSON object: {"breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "issuesByArea": {"title": [string], "description": [string], "tags": [string]}}. ' +
+    shared;
 
   const advanceSystemPrompt =
     `You are an SEO analyst for ${platform} video content. Score the given title, description, and tags in depth, and list concrete problems with them. ` +
-    'Reply with ONLY a JSON object: {"seoScore": number 0-100, "breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "issues": [string], "recommendedTags": [string], "notes": string, "competitorGapNotes": string}. ' +
-    'titleScore weighs length (40-70 chars ideal), keyword placement, and CTR/click-worthiness. descScore weighs length (150-300 words ideal for YouTube), keyword density, and hook strength in the first 2 lines. ' +
-    'tagScore weighs relevance and coverage breadth. "issues" is 3-6 SPECIFIC problems with THIS exact title/description/tags (e.g. exact char counts, missing hook, too few tags) — not generic tips. ' +
-    'recommendedTags is 5-10 additional tags the creator is missing. ' +
-    'competitorGapNotes is 1-2 sentences on what a top-ranking video in this niche likely does better than this one (packaging, pacing, hook strength, etc). No markdown, no extra text.';
+    'Reply with ONLY a JSON object: {"breakdown": {"titleScore": number 0-100, "descScore": number 0-100, "tagScore": number 0-100}, "issuesByArea": {"title": [string], "description": [string], "tags": [string]}, "recommendedTags": [string], "notes": string, "competitorGapNotes": string}. ' +
+    shared +
+    ' recommendedTags is 5-10 additional tags the creator is missing (no # symbol, not already in the existing tags). ' +
+    'notes is 1-2 sentences of the single most valuable improvement. ' +
+    'competitorGapNotes is 1-2 sentences on what a top-ranking video in this niche likely does better than this one (packaging, pacing, hook strength, etc).';
 
   const raw = await callGroq(
     mode === 'basic' ? basicSystemPrompt : advanceSystemPrompt,
-    `Title: ${title}\nDescription: ${description || '(none provided)'}\nExisting tags: ${(tags || []).join(', ') || '(none provided)'}`,
-    { json: true }
+    `Title: ${title}\nDescription: ${description || '(none provided)'}\nExisting tags: ${(tags || []).join(', ') || '(none provided)'}\nFACTS (counted by the server, trust these): ${JSON.stringify(facts)}`,
+    { json: true, temperature: 0.2 }
   );
 
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = parseJsonLoose(raw);
+
+    let titleScore = clamp100(parsed.breakdown?.titleScore);
+    let descScore = clamp100(parsed.breakdown?.descScore);
+    let tagScore = clamp100(parsed.breakdown?.tagScore);
+
+    // Hard caps from real facts: nothing to score = near-zero, no matter what the model says.
+    if (facts.descChars === 0) descScore = Math.min(descScore, 10);
+    if (facts.tagCount === 0) tagScore = Math.min(tagScore, 10);
+
+    const seoScore = clamp100(titleScore * SEO_WEIGHTS.title + descScore * SEO_WEIGHTS.desc + tagScore * SEO_WEIGHTS.tags);
+
+    const byArea = {
+      title: cleanStrings(parsed.issuesByArea?.title, 3),
+      description: cleanStrings(parsed.issuesByArea?.description, 3),
+      tags: cleanStrings(parsed.issuesByArea?.tags, 3)
+    };
+    // Flat list kept for older app versions (same shape as before).
+    const issues = [...byArea.title, ...byArea.description, ...byArea.tags].slice(0, 6);
+
     const result = {
-      seoScore: Math.round(Number(parsed.seoScore) || 0),
-      breakdown: {
-        titleScore: Math.round(Number(parsed.breakdown?.titleScore) || 0),
-        descScore: Math.round(Number(parsed.breakdown?.descScore) || 0),
-        tagScore: Math.round(Number(parsed.breakdown?.tagScore) || 0)
-      },
-      issues: Array.isArray(parsed.issues) ? parsed.issues.slice(0, 6) : []
+      seoScore,
+      breakdown: { titleScore, descScore, tagScore },
+      issues,
+      issuesByArea: byArea
     };
 
     if (mode === 'basic') {
       // Explicitly empty rather than omitted, so the frontend can always
-      // read the same shape and just show these as locked/blank for basic.
+      // read the same shape and show these as locked/blurred for basic.
       result.recommendedTags = [];
       result.notes = '';
       result.competitorGapNotes = '';
     } else {
-      result.recommendedTags = Array.isArray(parsed.recommendedTags) ? parsed.recommendedTags : [];
-      result.notes = parsed.notes || '';
-      result.competitorGapNotes = parsed.competitorGapNotes || '';
+      const have = new Set((tags || []).map((x) => String(x).trim().toLowerCase()));
+      result.recommendedTags = uniqueCI(cleanStrings(parsed.recommendedTags, 15).map((x) => x.replace(/^#/, '')))
+        .filter((x) => !have.has(x.toLowerCase()))
+        .slice(0, 10);
+      result.notes = String(parsed.notes || '').trim();
+      result.competitorGapNotes = String(parsed.competitorGapNotes || '').trim();
     }
 
     return result;
