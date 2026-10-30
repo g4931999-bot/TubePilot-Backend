@@ -487,7 +487,7 @@ router.get('/library', protect, async (req, res) => {
     if (req.user.youtubeChannel) {
       try {
         const accessToken = await ensureFreshTokenForVideos(req.user);
-        ytVideos = await listChannelVideos(accessToken);
+        ytVideos = await listChannelVideos(accessToken, { maxResults: 100 });
       } catch (err) {
         console.error('⚠️ [Library] Could not fetch YouTube channel videos:', err.message);
       }
@@ -514,6 +514,9 @@ router.get('/library', protect, async (req, res) => {
         tags: liveMatch?.tags || ytTarget?.tags || [],
         thumbnail: liveMatch?.thumbnail || ytTarget?.thumbnailUrl || '',
         status: video.status,
+        // UPDATE22: REAL numbers from YouTube only (null when the video is not live on YouTube yet)
+        viewCount: liveMatch && liveMatch.viewCount != null ? liveMatch.viewCount : null,
+        publishedAt: liveMatch?.publishedAt || null,
         createdAt: video.createdAt
       });
     });
@@ -529,11 +532,13 @@ router.get('/library', protect, async (req, res) => {
         tags: v.tags,
         thumbnail: v.thumbnail,
         status: 'uploaded',
+        viewCount: v.viewCount != null ? v.viewCount : null,
+        publishedAt: v.publishedAt || null,
         createdAt: v.publishedAt
       });
     });
 
-    items.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    items.sort((a, b) => new Date(b.publishedAt || b.createdAt || 0) - new Date(a.publishedAt || a.createdAt || 0));
 
     res.json({ success: true, videos: items });
   } catch (err) {
