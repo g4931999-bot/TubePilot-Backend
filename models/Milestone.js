@@ -7,6 +7,8 @@ const MilestoneSchema = new mongoose.Schema({
   videoId: { type: String, default: '' },
   videoTitle: { type: String, default: '' },
   channelTitle: { type: String, default: '' },
+  // UPDATE25: the channel's real @handle (YouTube snippet.customUrl), shown under the channel name on the card
+  channelHandle: { type: String, default: '' },
   // NEW: channel profile photo URL (shown as avatar badge in the app card + email)
   channelThumbnail: { type: String, default: '' },
   seen: { type: Boolean, default: false, index: true },
