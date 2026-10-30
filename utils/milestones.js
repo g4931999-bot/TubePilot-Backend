@@ -195,6 +195,7 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
     videoId: pick === 'views' ? lv.videoId : '',
     videoTitle: pick === 'views' ? lv.title : '',
     channelTitle: stats.channelTitle,
+    channelHandle: stats.channelHandle || '', // UPDATE25: real @handle from YouTube
     channelThumbnail: pickThumbnail(user, stats) // NEW
   });
 
