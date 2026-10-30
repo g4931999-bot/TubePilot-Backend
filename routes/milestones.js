@@ -10,6 +10,16 @@ const testOn = () => process.env.MILESTONE_TEST_MODE === '1';
 
 const router = express.Router();
 
+// UPDATE25: handle saved on the milestone; for older cards (created before handles were saved)
+// fall back to whatever the user's saved channel already holds. Empty string if none - never invented.
+const handleFor = (milestone, user) => {
+  const c = (user && user.youtubeChannel) || {};
+  const raw = [milestone.channelHandle, c.channelHandle, c.handle, c.customUrl]
+    .find((h) => typeof h === 'string' && h.trim()) || '';
+  const h = raw.trim();
+  return h ? (h.startsWith('@') ? h : `@${h}`) : '';
+};
+
 // @route GET /api/milestones/pending
 // Latest card the user has not seen yet (or null).
 router.get('/pending', protect, async (req, res) => {
@@ -24,6 +34,7 @@ router.get('/pending', protect, async (req, res) => {
             value: milestone.value,
             videoTitle: milestone.videoTitle,
             channelTitle: milestone.channelTitle,
+            channelHandle: handleFor(milestone, req.user), // UPDATE25
             channelThumbnail: milestone.channelThumbnail || '', // NEW
             createdAt: milestone.createdAt
           }
@@ -61,7 +72,7 @@ router.post('/test-reset', protect, async (req, res) => {
       success: true,
       created: !!doc,
       emailSent: doc ? doc.emailSent : false,
-      milestone: doc ? { type: doc.type, value: doc.value, channelTitle: doc.channelTitle, channelThumbnail: doc.channelThumbnail } : null,
+      milestone: doc ? { type: doc.type, value: doc.value, channelTitle: doc.channelTitle, channelHandle: doc.channelHandle, channelThumbnail: doc.channelThumbnail } : null,
       hint: doc ? 'Open the app home screen to see the popup.' : 'No milestone reached yet, or YouTube stats failed. Check server logs.'
     });
   } catch (err) {
