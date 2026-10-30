@@ -205,7 +205,10 @@ const getMilestoneStats = async (accessToken) => {
   // channelThumbnail is saved on the milestone so the app card + email can show the channel photo.
   const sn = ch.snippet || {};
   const channelThumbnail = sn.thumbnails?.high?.url || sn.thumbnails?.medium?.url || sn.thumbnails?.default?.url || '';
-  return { channelTitle: sn.title || '', channelThumbnail, subscribers, latestVideo };
+  // UPDATE25: the channel's real @handle, straight from YouTube (snippet.customUrl, e.g. "@mychannel").
+  const rawHandle = (sn.customUrl || '').trim();
+  const channelHandle = rawHandle ? (rawHandle.startsWith('@') ? rawHandle : `@${rawHandle}`) : '';
+  return { channelTitle: sn.title || '', channelHandle, channelThumbnail, subscribers, latestVideo };
 };
 
 const isInvalidGrantError = (err) => {
