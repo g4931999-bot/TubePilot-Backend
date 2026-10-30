@@ -144,7 +144,7 @@ const handleVerifyPayment = async (req, res) => {
     const { orderId } = req.body;
     if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
 
-    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, user: req.user._id });
+    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, user: req.user._id, type: 'diamond_purchase' });
     if (!transaction) return res.status(404).json({ success: false, message: 'Transaction not found' });
 
     if (transaction.status === 'approved') {
@@ -230,6 +230,18 @@ router.post('/payu/webhook', async (req, res) => {
 
     const transaction = await Transaction.findOne({ cashfreeOrderId: String(txnid), paymentMethod: 'payu' });
     if (!transaction || transaction.status === 'approved') return res.status(200).json({ success: true });
+
+    // UPDATE23: Live Plan orders use the same PayU webhook - hand them to the live-plan credit logic
+    // (never the diamond credit, which would add NaN diamonds to the wallet).
+    if (transaction.type === 'live_plan_purchase') {
+      const stLive = await checkPayuStatus(transaction);
+      console.log(`💳 [PayU Webhook] live plan txn ${txnid}: ${stLive}`);
+      if (stLive === 'PAID') {
+        const live = require('./livePlans'); // lazy: avoids a circular import
+        await live.creditApprovedLivePlanTransaction(transaction._id, 'PayU webhook');
+      }
+      return res.status(200).json({ success: true });
+    }
 
     const st = await checkPayuStatus(transaction);
     console.log(`💳 [PayU Webhook] txn ${txnid}: ${st}`);
