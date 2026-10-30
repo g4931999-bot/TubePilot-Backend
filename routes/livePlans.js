@@ -4,7 +4,8 @@ const Transaction = require('../models/Transaction');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
-const { createCashfreeOrder, getCashfreeOrderStatus, isConfigured: cashfreeConfigured, CASHFREE_ENV } = require('../utils/cashfree');
+const crypto = require('crypto');
+const { isConfigured: payuConfigured, IS_PROD, buildCheckoutParams, verifyPayment } = require('../utils/payu');
 
 const router = express.Router();
 
@@ -44,7 +45,8 @@ router.get('/', protect, (req, res) => {
     freeTrialMinutes: 5,
     freeTrialUsed: req.user.liveStream?.freeTrialUsed || false,
     currentPlan: req.user.liveStream || null,
-    cashfreeEnvironment: CASHFREE_ENV
+    paymentGateway: 'payu',
+    payuEnvironment: IS_PROD ? 'PRODUCTION' : 'TEST'
   });
 });
 
@@ -92,19 +94,41 @@ const creditApprovedLivePlanTransaction = async (transactionId, source) => {
   return { claimed, updatedUser };
 };
 
+// Asks PayU directly. Returns 'PAID' | 'FAILED' | 'PENDING'. Amount is always cross-checked.
+// (txnid is stored in Transaction.cashfreeOrderId - old field name kept to avoid a migration.)
+const checkPayuStatus = async (transaction) => {
+  const d = await verifyPayment(transaction.cashfreeOrderId);
+  if (!d) return 'PENDING';
+  const st = String(d.status || '').toLowerCase();
+  if (st === 'success') {
+    const paid = Number(d.amt ?? d.transaction_amount);
+    if (!Number.isFinite(paid) || Math.abs(paid - transaction.amountINR) > 0.01) {
+      console.error(`🚨 [PayU/Live] AMOUNT MISMATCH txn=${transaction.cashfreeOrderId} paid=${paid} expected=${transaction.amountINR} — NOT crediting`);
+      return 'PENDING';
+    }
+    return 'PAID';
+  }
+  if (['failure', 'failed', 'usercancelled', 'bounced', 'dropped'].includes(st)) return 'FAILED';
+  return 'PENDING';
+};
+
 // @route POST /api/live-plans/create-order
 // Body: { category: 'day' | 'month', planName: 'Starter' }
+// Response: { orderId (PayU txnid), transactionId, payu: {key, txnid, amount, ...} } - same shape as the Diamond Store.
 router.post('/create-order', protect, async (req, res) => {
   try {
     const { category, planName } = req.body;
     const plan = findPlan(category, planName);
-
     if (!plan) {
       return res.status(400).json({ success: false, message: 'Invalid plan selection.' });
     }
 
-    const userIdentifier = req.user.userId || req.user._id.toString().slice(-6);
-    const orderId = `TPLIVE${userIdentifier}_${Date.now()}`;
+    const userIdentifier = String(req.user.userId || req.user._id.toString().slice(-6));
+    // PayU txnid: alphanumeric only, max 25 chars
+    const txnid = `TPL${Date.now()}${crypto.randomBytes(2).toString('hex')}`;
+    const productinfo = `Live ${plan.name} ${category === 'day' ? 'Day' : 'Month'} Pass`.replace(/[^A-Za-z0-9 ]/g, '');
+
+    const payu = buildCheckoutParams({ txnid, amount: plan.priceINR, productinfo, user: req.user, userIdentifier });
 
     const transaction = await Transaction.create({
       user: req.user._id,
@@ -115,50 +139,18 @@ router.post('/create-order', protect, async (req, res) => {
       livePlanName: plan.name,
       liveHoursGranted: plan.hours,
       status: 'pending',
-      paymentMethod: 'cashfree',
-      cashfreeOrderId: orderId
+      paymentMethod: 'payu',
+      cashfreeOrderId: txnid // reused field: holds the PayU txnid
     });
 
-    let order;
-    try {
-      order = await createCashfreeOrder({
-        orderId,
-        amount: plan.priceINR,
-        customerId: userIdentifier,
-        customerPhone: req.user.phone,
-        customerEmail: req.user.email,
-        customerName: req.user.name
-      });
-    } catch (cfErr) {
-      // Cashfree ne order banaya hi nahi — pending transaction ko turant
-      // rejected mark karo, warna auto-check job 24 ghante tak har minute
-      // is bekaar order ko check karti rahegi.
-      transaction.status = 'rejected';
-      transaction.adminNote = `Cashfree order creation failed: ${cfErr.response?.data?.message || cfErr.message}`;
-      await transaction.save();
-      throw cfErr;
-    }
+    console.log(`💳 [PayU/Live] Order created — user ${req.user._id}, txnid=${txnid}, plan=${plan.name} (${category}), ₹${plan.priceINR}`);
 
-    transaction.paymentSessionId = order.paymentSessionId;
-    await transaction.save();
-
-    console.log(`💳 [Cashfree/Live] Order created — user ${req.user._id}, orderId=${orderId}, plan=${plan.name} (${category}), amount=₹${plan.priceINR}`);
-
-    res.status(201).json({
-      success: true,
-      orderId: order.orderId,
-      paymentSessionId: order.paymentSessionId,
-      transactionId: transaction._id
-    });
+    res.status(201).json({ success: true, orderId: txnid, transactionId: transaction._id, payu });
   } catch (err) {
-    if (err.code === 'CASHFREE_NOT_CONFIGURED') {
+    if (err.code === 'PAYU_NOT_CONFIGURED') {
       return res.status(503).json({ success: false, message: err.message, code: err.code });
     }
-    if (err.response?.data?.code === 'payment_gateway_inactive') {
-      console.error('❌ [Cashfree/Live] Cashfree account par Payment Gateway activate nahi hai.');
-      return res.status(503).json({ success: false, message: 'Payment abhi available nahi hai. Kripya thodi der baad try karein.' });
-    }
-    console.error('❌ [Cashfree/Live] create-order failed:', err.response?.data || err.message);
+    console.error('❌ [PayU/Live] create-order failed:', err.response?.data || err.message);
     res.status(500).json({ success: false, message: 'Could not start payment. Please try again.' });
   }
 });
@@ -169,18 +161,21 @@ router.post('/verify-payment', protect, async (req, res) => {
     const { orderId } = req.body;
     if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
 
-    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, user: req.user._id });
+    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, user: req.user._id, type: 'live_plan_purchase' });
     if (!transaction) return res.status(404).json({ success: false, message: 'Transaction not found' });
 
     if (transaction.status === 'approved') {
       return res.json({ success: true, status: 'approved', message: 'Payment already confirmed', transaction });
     }
+    if (transaction.status === 'rejected') {
+      return res.json({ success: true, status: 'rejected', message: 'Payment was not completed', transaction });
+    }
 
-    const cfOrder = await getCashfreeOrderStatus(orderId);
+    const st = await checkPayuStatus(transaction);
+    console.log(`💳 [PayU/Live] Verify — txn ${orderId}: ${st}`);
 
-    if (cfOrder.order_status === 'PAID') {
-      const result = await creditApprovedLivePlanTransaction(transaction._id, 'Cashfree');
-
+    if (st === 'PAID') {
+      const result = await creditApprovedLivePlanTransaction(transaction._id, 'PayU');
       if (!result) {
         const current = await Transaction.findById(transaction._id);
         return res.json({
@@ -190,108 +185,61 @@ router.post('/verify-payment', protect, async (req, res) => {
           transaction: current
         });
       }
-
-      return res.json({
-        success: true,
-        status: 'approved',
-        message: 'Payment confirmed, live plan activated',
-        transaction: result.claimed
-      });
+      return res.json({ success: true, status: 'approved', message: 'Payment confirmed, live plan activated', transaction: result.claimed });
     }
 
-    if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
-      transaction.status = 'rejected';
-      transaction.adminNote = `Cashfree order status: ${cfOrder.order_status}`;
-      await transaction.save();
-      return res.json({ success: true, status: 'rejected', message: 'Payment was not completed', transaction });
-    }
-
-    return res.json({ success: true, status: 'pending', message: 'Payment not completed yet', transaction });
+    // FAILED: DB stays 'pending' (a late success can still arrive); auto-check expires it after 24h.
+    return res.json({ success: true, status: st === 'FAILED' ? 'failed' : 'pending', message: st === 'FAILED' ? 'Payment was not completed' : 'Payment not completed yet', transaction });
   } catch (err) {
-    console.error('❌ [Cashfree/Live] verify-payment failed:', err.response?.data || err.message);
+    console.error('❌ [PayU/Live] verify-payment failed:', err.response?.data || err.message);
     res.status(500).json({ success: false, message: 'Could not verify payment.' });
   }
 });
 
-// @route POST /api/live-plans/webhook
-router.post('/webhook', async (req, res) => {
-  try {
-    const orderId = req.body?.data?.order?.order_id;
-    if (!orderId) return res.status(200).json({ success: true });
-
-    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, type: 'live_plan_purchase' });
-    if (!transaction || transaction.status === 'approved') {
-      return res.status(200).json({ success: true });
-    }
-
-    const cfOrder = await getCashfreeOrderStatus(orderId);
-
-    if (cfOrder.order_status === 'PAID') {
-      await creditApprovedLivePlanTransaction(transaction._id, 'Cashfree webhook');
-    }
-
-    res.status(200).json({ success: true });
-  } catch (err) {
-    console.error('❌ [Cashfree/Live Webhook] error:', err.response?.data || err.message);
-    res.status(200).json({ success: true });
-  }
-});
-
 // -----------------------------------------------------------------------
-// Background auto-check — pending live-plan orders ke liye (jaise
-// diamond.js mein hai, isi pattern se). Har 60 second check karta hai.
+// Background auto-check (safety net) - pending live-plan PayU orders, every 60s.
+// PayU's own webhook (/api/payment/payu/webhook, in diamonds.js) also hands live-plan
+// orders to creditApprovedLivePlanTransaction below.
 // -----------------------------------------------------------------------
+const AUTO_CHECK_MAX_AGE_HOURS = 24;
 let autoCheckRunning = false;
 
 async function autoCheckPendingLiveOrders() {
   if (autoCheckRunning) return;
   autoCheckRunning = true;
-
   try {
-    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-
+    const cutoff = new Date(Date.now() - AUTO_CHECK_MAX_AGE_HOURS * 60 * 60 * 1000);
     const pending = await Transaction.find({
-      type: 'live_plan_purchase',
-      status: 'pending',
-      paymentMethod: 'cashfree',
-      createdAt: { $gte: cutoff }
-    }).limit(50);
+      type: 'live_plan_purchase', status: 'pending', paymentMethod: 'payu', createdAt: { $gte: cutoff }
+    }).limit(100);
 
     for (const transaction of pending) {
-      // paymentSessionId tabhi save hota hai jab Cashfree ne order sach mein
-      // banaya ho. Nahi hai matlab order Cashfree par exist hi nahi karta —
-      // check karne ka koi matlab nahi, seedha rejected mark karo.
-      if (!transaction.paymentSessionId) {
-        await Transaction.findOneAndUpdate(
-          { _id: transaction._id, status: 'pending' },
-          { $set: { status: 'rejected', adminNote: 'Order never created at Cashfree (auto-check)' } }
-        );
-        continue;
-      }
       try {
-        const cfOrder = await getCashfreeOrderStatus(transaction.cashfreeOrderId);
-        if (cfOrder.order_status === 'PAID') {
-          await creditApprovedLivePlanTransaction(transaction._id, 'auto-check job');
-        } else if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
-          await Transaction.findOneAndUpdate(
-            { _id: transaction._id, status: 'pending' },
-            { $set: { status: 'rejected', adminNote: `Cashfree order status: ${cfOrder.order_status} (auto-check)` } }
-          );
+        const st = await checkPayuStatus(transaction);
+        if (st === 'PAID') {
+          const result = await creditApprovedLivePlanTransaction(transaction._id, 'auto-check job');
+          if (result) console.log(`✅ [PayU/Live AutoCheck] txn ${transaction.cashfreeOrderId}: plan activated`);
         }
       } catch (err) {
-        console.error(`❌ [Live AutoCheck] order ${transaction.cashfreeOrderId} check failed:`, err.message);
+        console.error(`❌ [PayU/Live AutoCheck] txn ${transaction.cashfreeOrderId} failed:`, err.response?.data || err.message);
       }
     }
+
+    await Transaction.updateMany(
+      { type: 'live_plan_purchase', status: 'pending', paymentMethod: 'payu', createdAt: { $lt: cutoff } },
+      { $set: { status: 'rejected', adminNote: `Auto-expired — no payment confirmation within ${AUTO_CHECK_MAX_AGE_HOURS}h` } }
+    );
   } catch (err) {
-    console.error('❌ [Live AutoCheck] job run failed:', err.message);
+    console.error('❌ [PayU/Live AutoCheck] job run failed:', err.message);
   } finally {
     autoCheckRunning = false;
   }
 }
 
-if (cashfreeConfigured) {
+if (payuConfigured) {
   setInterval(autoCheckPendingLiveOrders, 60 * 1000);
-  console.log('🔄 [Live AutoCheck] background job started for live-plan orders');
+  console.log('🔄 [PayU/Live AutoCheck] background job started for live-plan orders');
 }
 
 module.exports = router;
+module.exports.creditApprovedLivePlanTransaction = creditApprovedLivePlanTransaction;
