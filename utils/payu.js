@@ -12,6 +12,14 @@ const VERIFY_URL = IS_PROD
   ? 'https://info.payu.in/merchant/postservice?form=2'
   : 'https://test.payu.in/merchant/postservice?form=2';
 
+// Recurring (SI) APIs. Pre-debit has its own test host in PayU's docs.
+const SI_URL = IS_PROD
+  ? 'https://info.payu.in/merchant/postservice.php?form=2'
+  : 'https://test.payu.in/merchant/postservice.php?form=2';
+const PRE_DEBIT_URL = IS_PROD
+  ? 'https://info.payu.in/merchant/postservice.php?form=2'
+  : 'https://test.info.payu.in/merchant/postservice.php?form=2';
+
 console.log(`ℹ️  [PayU] env=${IS_PROD ? 'PRODUCTION' : 'TEST'}, configured=${isConfigured}, base=${APP_BASE || '(NOT SET)'}`);
 
 const sha512 = (s) => crypto.createHash('sha512').update(s).digest('hex');
@@ -65,4 +73,52 @@ const verifyPayment = async (txnid) => {
   return res.data?.transaction_details?.[txnid] || null;
 };
 
-module.exports = { isConfigured, PAYU_KEY, IS_PROD, generateHash, buildCheckoutParams, verifyPayment };
+// ---------------------------------------------------------------------------
+// Recurring payments (Standing Instruction). hash = sha512(key|command|var1|salt)
+// ---------------------------------------------------------------------------
+const callPostService = async (url, command, var1Obj) => {
+  if (!isConfigured) throw new Error('PayU credentials are missing.');
+  const var1 = JSON.stringify(var1Obj);
+  const hash = sha512(`${PAYU_KEY}|${command}|${var1}|${PAYU_SALT}`);
+  const body = new URLSearchParams({ key: PAYU_KEY, command, var1, hash });
+  const res = await axios.post(url, body.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 30000
+  });
+  let data = res.data;
+  if (typeof data === 'string') {
+    try { data = JSON.parse(data); } catch (_) { /* keep raw string */ }
+  }
+  return data;
+};
+
+// Mandatory notice to the customer BEFORE a recurring debit.
+// debitDate: 'YYYY-MM-DD'. Success => { status: '1' | 1 }.
+const preDebitNotify = ({ authPayuId, requestId, debitDate, amount, invoice }) =>
+  callPostService(PRE_DEBIT_URL, 'pre_debit_SI', {
+    authpayuid: authPayuId,
+    requestid: requestId,
+    debitdate: debitDate,
+    amount: Number(amount).toFixed(2),
+    ...(invoice ? { invoiceDisplayNumber: invoice } : {})
+  });
+
+// The actual recurring debit. Success => details[txnid].status === 'captured'.
+const chargeRecurring = ({ authPayuId, txnid, amount, invoice, phone, email }) =>
+  callPostService(SI_URL, 'si_transaction', {
+    authpayuid: authPayuId,
+    invoiceDisplayNumber: invoice,
+    amount: Number(amount).toFixed(2),
+    txnid,
+    phone,
+    email
+  });
+
+// Cancels the autopay mandate. Success => { status: 1 }.
+const revokeMandate = ({ authPayuId, requestId }) =>
+  callPostService(SI_URL, 'mandate_revoke', { authPayuId, authpayuid: authPayuId, requestId });
+
+module.exports = {
+  isConfigured, PAYU_KEY, IS_PROD, generateHash, buildCheckoutParams, verifyPayment,
+  preDebitNotify, chargeRecurring, revokeMandate
+};
