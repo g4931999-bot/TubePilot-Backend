@@ -100,7 +100,13 @@ const UserSchema = new mongoose.Schema({
   referredBy: { type: String, default: null },
   diamondBalance: { type: Number, default: 0 },
   autoRefillDiamonds: { type: Boolean, default: false },
-  freeUploadsRemaining: { type: Number, default: 20 },
+
+  // ⚠️ UPDATED (Boss request — upload credits): NEW users no longer get 20 free uploads.
+  //   ₹1 plan payment  -> +20 uploads
+  //   credits reach 0  -> notice -> 24h later ₹10 auto-debit -> +30 uploads and +99 diamonds (1 month)
+  // This counter is THE "credit" — every plan upload is deducted from it (routes/video.js chargeForUpload),
+  // and cron/subscriptionScheduler.js watches it hitting 0. Existing users keep whatever they still have.
+  freeUploadsRemaining: { type: Number, default: 0 },
   freeUploadsResetAt: { type: Date, default: () => new Date(new Date().setMonth(new Date().getMonth() + 1)) },
   storageUsedBytes: { type: Number, default: 0 },
   fcmTokens: [{ type: String }],
