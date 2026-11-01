@@ -7,6 +7,7 @@ const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
 const { isConfigured: payuConfigured, PAYU_KEY, IS_PROD, generateHash, buildCheckoutParams, verifyPayment } = require('../utils/payu');
 const GiftCode = require('../models/GiftCode');
+const { AI_DIAMOND_COST } = require('../utils/aiCost');
 
 const router = express.Router();
 
@@ -19,9 +20,9 @@ const DIAMOND_PACKAGES_BASE = [
 ];
 
 const buildFeatureList = (pkg) => [
-  { label: 'AI Title Generation', included: true },
-  { label: 'AI Description Generation', included: true },
-  { label: 'AI Hashtag Generation', included: true },
+  { label: `AI Title Generation (${AI_DIAMOND_COST} diamond per use)`, included: true },
+  { label: `AI Description Generation (${AI_DIAMOND_COST} diamond per use)`, included: true },
+  { label: `AI Hashtag Generation (${AI_DIAMOND_COST} diamond per use)`, included: true },
   {
     label: pkg.thumbnailPrompts === 1 ? '1 Thumbnail Prompt' : `${pkg.thumbnailPrompts} Thumbnail Prompts`,
     included: pkg.thumbnailPrompts > 0
@@ -37,7 +38,7 @@ const buildFeatureList = (pkg) => [
 const DIAMOND_PACKAGES = DIAMOND_PACKAGES_BASE.map((pkg) => ({ ...pkg, features: buildFeatureList(pkg) }));
 
 router.get('/packages', protect, (req, res) => {
-  res.json({ success: true, packages: DIAMOND_PACKAGES, currentBalance: req.user.diamondBalance, paymentGateway: 'payu', payuEnvironment: IS_PROD ? 'PRODUCTION' : 'TEST' });
+  res.json({ success: true, packages: DIAMOND_PACKAGES, aiCostPerUse: AI_DIAMOND_COST, currentBalance: req.user.diamondBalance, paymentGateway: 'payu', payuEnvironment: IS_PROD ? 'PRODUCTION' : 'TEST' });
 });
 
 // ONLY place that flips a transaction to 'approved' and credits diamonds.
@@ -230,6 +231,14 @@ router.post('/payu/webhook', async (req, res) => {
 
     const transaction = await Transaction.findOne({ cashfreeOrderId: String(txnid), paymentMethod: 'payu' });
     if (!transaction || transaction.status === 'approved') return res.status(200).json({ success: true });
+
+    // Subscription (Rs1 intro / monthly Rs10 autopay) orders: handled by routes/subscription.js
+    if (transaction.type === 'subscription_charge') {
+      const subRoute = require('./subscription'); // lazy: avoids a circular import
+      const r = await subRoute.finalizeFromPayu(transaction._id, 'PayU webhook');
+      console.log(`💳 [PayU Webhook] subscription txn ${txnid}: ${r.state}`);
+      return res.status(200).json({ success: true });
+    }
 
     // UPDATE23: Live Plan orders use the same PayU webhook - hand them to the live-plan credit logic
     // (never the diamond credit, which would add NaN diamonds to the wallet).

@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const { protect } = require('../middleware/auth');
 const { pickAvailableCloudinaryAccount, uploadBufferToCloudinary } = require('../utils/cloudinary');
+const { hasUploadCredit } = require('../utils/uploadCredits');
 
 const router = express.Router();
 
@@ -36,6 +37,21 @@ const IMAGE_FIELDS = [
   { name: 'images', maxCount: MAX_IMAGES_PER_REQUEST }
 ];
 
+// ⚠️ NEW: a user with NO upload left (0 plan uploads AND not enough diamonds for a diamond-paid upload)
+// must not be able to push images into our Cloudinary storage for free. Runs BEFORE multer, so the
+// files are rejected without even being read into memory. Same 402 + code the video upload uses,
+// so the app shows the same "get credits" prompt (₹1 offer / diamond store).
+const requireUploadCredit = (req, res, next) => {
+  if (!hasUploadCredit(req.user)) {
+    return res.status(402).json({
+      success: false,
+      code: 'INSUFFICIENT_DIAMONDS',
+      message: 'Your upload credits are over. Please activate the ₹1 plan or buy diamonds to upload.'
+    });
+  }
+  next();
+};
+
 // Wraps multer so its errors (bad mimetype, file too large, too many files)
 // come back as the same { success:false, message } JSON shape as the rest
 // of the API instead of multer's default plain-text/HTML error.
@@ -66,7 +82,7 @@ const handleImageUpload = (req, res, next) => {
  * returns the hosted URLs so the client can pass them straight into
  * POST /api/posts/instagram/carousel as `mediaItems: urls.map(url => ({url}))`.
  */
-router.post('/image', protect, handleImageUpload, async (req, res) => {
+router.post('/image', protect, requireUploadCredit, handleImageUpload, async (req, res) => {
   try {
     const files = [...(req.files?.image || []), ...(req.files?.images || [])];
     if (files.length === 0) {

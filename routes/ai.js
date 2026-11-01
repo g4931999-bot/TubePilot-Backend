@@ -1,19 +1,44 @@
 const express = require('express');
 const { protect } = require('../middleware/auth');
+const User = require('../models/User');
 const { generateTitle, generateTitleOptions, generateDescription, generateDescriptionOptions, generateTags, generateCaption, generateHashtags, generateAiScript, analyzeSeoScore } = require('../utils/groq');
+const { AI_DIAMOND_COST } = require('../utils/aiCost');
 
 const router = express.Router();
 
-const AI_FEATURE_COST = { title: 2, description: 2, tags: 2, caption: 2, hashtags: 2, ideas: 3, seoScore: 1, titleOptions: 3, descriptionOptions: 3 };
+// ---------------------------------------------------------------------------
+// ⚠️ UPDATED: EVERY AI feature now costs the same flat AI_DIAMOND_COST (= 1 diamond, utils/aiCost.js)
+// — title, description, tags, caption, hashtags, title/description options, SEO analysis.
+// Change the number in ONE place (env AI_DIAMOND_COST) and every route follows.
+//
+// /ideas stays FREE by default because the dashboard "AI Idea" popup calls it automatically once a day
+// (charging it would silently eat diamonds). Set env AI_CHARGE_IDEAS=true to charge it too.
+// /thumbnail-prompt stays quota-based (each pack gives a fixed number of thumbnail prompts).
+// ---------------------------------------------------------------------------
+const CHARGE_IDEAS = String(process.env.AI_CHARGE_IDEAS || '') === 'true';
 
+// Atomic: balance check + deduction in ONE database operation, so two quick taps can never
+// spend the same diamond twice or push the balance below zero.
 const chargeDiamonds = async (user, cost) => {
-  if (user.diamondBalance < cost) {
+  if (cost <= 0) return;
+  const updated = await User.findOneAndUpdate(
+    { _id: user._id, diamondBalance: { $gte: cost } },
+    { $inc: { diamondBalance: -cost } },
+    { new: true }
+  );
+  if (!updated) {
     const err = new Error('Not enough diamonds for this AI feature');
     err.code = 'INSUFFICIENT_DIAMONDS';
     throw err;
   }
-  user.diamondBalance -= cost;
-  await user.save();
+  user.diamondBalance = updated.diamondBalance;
+};
+
+// If the AI provider fails AFTER we charged, the user gets the diamond back.
+const refundDiamonds = async (user, cost) => {
+  if (cost <= 0) return;
+  const updated = await User.findByIdAndUpdate(user._id, { $inc: { diamondBalance: cost } }, { new: true });
+  if (updated) user.diamondBalance = updated.diamondBalance;
 };
 
 const logAiError = (routeName, err) => {
@@ -21,8 +46,7 @@ const logAiError = (routeName, err) => {
   if (err.stack) console.error(err.stack);
 };
 
-// ⚠️ NEW: Video SEO Optimizer features unlock for ANY paid pack
-// (seoScoreLevel !== 'none'). Same rule as /seo-score below.
+// Video SEO Optimizer features unlock for ANY paid pack (seoScoreLevel !== 'none'). Same rule as /seo-score.
 const hasSeoPlan = (user) => user.seoScoreLevel && user.seoScoreLevel !== 'none';
 
 const planUpgradeBody = {
@@ -30,6 +54,32 @@ const planUpgradeBody = {
   message: 'Video SEO Optimizer is not included in your current plan. Please upgrade from the Diamond Store.',
   code: 'PLAN_UPGRADE_REQUIRED'
 };
+
+// One shared handler for every diamond-charged AI route.
+//   validate(body) -> error message string | null
+//   run(body, user) -> object merged into the JSON response
+const aiRoute = (routeName, { cost = AI_DIAMOND_COST, requirePlan = false, validate, run }) => async (req, res) => {
+  let charged = false;
+  try {
+    if (requirePlan && !hasSeoPlan(req.user)) return res.status(402).json(planUpgradeBody);
+
+    const problem = validate ? validate(req.body || {}) : null;
+    if (problem) return res.status(400).json({ success: false, message: problem });
+
+    await chargeDiamonds(req.user, cost);
+    charged = true;
+
+    const payload = await run(req.body || {}, req.user);
+    res.json({ success: true, ...payload, diamondsCharged: cost, remainingDiamonds: req.user.diamondBalance });
+  } catch (err) {
+    logAiError(routeName, err);
+    if (charged) await refundDiamonds(req.user, cost).catch(() => {});
+    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
+    res.status(status).json({ success: false, message: err.message, ...(err.code ? { code: err.code } : {}) });
+  }
+};
+
+const needTopic = (b) => (!b.topic ? 'topic is required' : null);
 
 router.get('/debug-env', protect, (req, res) => {
   res.json({
@@ -39,180 +89,89 @@ router.get('/debug-env', protect, (req, res) => {
     hasOpenRouterKey: !!process.env.OPENROUTER_API_KEY,
     groqModel: process.env.GROQ_MODEL || 'openai/gpt-oss-120b (default)',
     openRouterModel: process.env.OPENROUTER_MODEL || 'openai/gpt-oss-120b (default)',
+    aiDiamondCost: AI_DIAMOND_COST,
     nodeEnv: process.env.NODE_ENV || '(not set)'
   });
 });
 
-router.post('/title', protect, async (req, res) => {
-  try {
-    const { topic } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
+router.post('/title', protect, aiRoute('title', {
+  validate: needTopic,
+  run: async (b) => ({ title: await generateTitle(b.topic) })
+}));
 
-    await chargeDiamonds(req.user, AI_FEATURE_COST.title);
-    const title = await generateTitle(topic);
-    res.json({ success: true, title, diamondsCharged: AI_FEATURE_COST.title, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('title', err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
+// Generic routes (AI Title Generator screen, open to anyone with diamonds) and the SEO routes
+// (Video SEO Optimizer, paid packs only) run the same logic — SEO ones check the plan first.
+const titleOptions = (name, requirePlan) => aiRoute(name, {
+  requirePlan,
+  validate: needTopic,
+  run: async (b) => ({ titles: await generateTitleOptions(b.topic, b.count) })
+});
+const descriptionOptions = (name, requirePlan) => aiRoute(name, {
+  requirePlan,
+  validate: needTopic,
+  run: async (b) => ({ descriptions: await generateDescriptionOptions(b.topic, b.count) })
 });
 
-// Shared handlers: the generic route (AI Title Generator screen, open to anyone
-// with diamonds) and the SEO route (Video SEO Optimizer, paid packs only) run
-// the exact same logic - the SEO route just checks the plan first.
-const handleTitleOptions = (routeName, requirePlan) => async (req, res) => {
-  try {
-    if (requirePlan && !hasSeoPlan(req.user)) return res.status(402).json(planUpgradeBody);
+router.post('/title-options', protect, titleOptions('title-options', false));
+router.post('/description-options', protect, descriptionOptions('description-options', false));
+router.post('/seo-title-options', protect, titleOptions('seo-title-options', true));
+router.post('/seo-description-options', protect, descriptionOptions('seo-description-options', true));
 
-    const { topic, count } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
+router.post('/description', protect, aiRoute('description', {
+  validate: needTopic,
+  run: async (b) => ({ description: await generateDescription(b.topic) })
+}));
 
-    await chargeDiamonds(req.user, AI_FEATURE_COST.titleOptions);
-    const titles = await generateTitleOptions(topic, count);
-    res.json({ success: true, titles, diamondsCharged: AI_FEATURE_COST.titleOptions, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError(routeName, err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
-};
+router.post('/tags', protect, aiRoute('tags', {
+  validate: needTopic,
+  run: async (b) => ({ tags: await generateTags(b.topic) })
+}));
 
-const handleDescriptionOptions = (routeName, requirePlan) => async (req, res) => {
-  try {
-    if (requirePlan && !hasSeoPlan(req.user)) return res.status(402).json(planUpgradeBody);
+router.post('/caption', protect, aiRoute('caption', {
+  validate: (b) => {
+    if (!b.topic) return 'topic is required';
+    if (!['instagram', 'facebook'].includes(b.platform)) return 'platform must be instagram or facebook';
+    return null;
+  },
+  run: async (b) => ({ caption: await generateCaption(b.topic, b.platform) })
+}));
 
-    const { topic, count } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
+router.post('/hashtags', protect, aiRoute('hashtags', {
+  validate: (b) => {
+    if (!b.topic) return 'topic is required';
+    if (!['youtube', 'instagram', 'facebook'].includes(b.platform)) return 'platform must be youtube, instagram, or facebook';
+    return null;
+  },
+  run: async (b) => ({ hashtags: await generateHashtags(b.topic, b.platform) })
+}));
 
-    await chargeDiamonds(req.user, AI_FEATURE_COST.descriptionOptions);
-    const descriptions = await generateDescriptionOptions(topic, count);
-    res.json({ success: true, descriptions, diamondsCharged: AI_FEATURE_COST.descriptionOptions, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError(routeName, err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
-};
-
-router.post('/title-options', protect, handleTitleOptions('title-options', false));
-router.post('/description-options', protect, handleDescriptionOptions('description-options', false));
-
-// ⚠️ NEW: Video SEO Optimizer versions - need ANY paid pack (seoScoreLevel !== 'none').
-router.post('/seo-title-options', protect, handleTitleOptions('seo-title-options', true));
-router.post('/seo-description-options', protect, handleDescriptionOptions('seo-description-options', true));
-
-router.post('/description', protect, async (req, res) => {
-  try {
-    const { topic } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
-
-    await chargeDiamonds(req.user, AI_FEATURE_COST.description);
-    const description = await generateDescription(topic);
-    res.json({ success: true, description, diamondsCharged: AI_FEATURE_COST.description, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('description', err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
-});
-
-router.post('/tags', protect, async (req, res) => {
-  try {
-    const { topic } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
-
-    await chargeDiamonds(req.user, AI_FEATURE_COST.tags);
-    const tags = await generateTags(topic);
-    res.json({ success: true, tags, diamondsCharged: AI_FEATURE_COST.tags, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('tags', err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
-});
-
-router.post('/caption', protect, async (req, res) => {
-  try {
-    const { topic, platform } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
-    if (!['instagram', 'facebook'].includes(platform)) {
-      return res.status(400).json({ success: false, message: 'platform must be instagram or facebook' });
-    }
-
-    await chargeDiamonds(req.user, AI_FEATURE_COST.caption);
-    const caption = await generateCaption(topic, platform);
-    res.json({ success: true, caption, diamondsCharged: AI_FEATURE_COST.caption, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('caption', err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
-});
-
-// 'youtube' added to the allowed platform list, so the AI Title/
-// Description/Hashtags generator screen can call this with
-// platform: 'youtube'. instagram/facebook unchanged.
-router.post('/hashtags', protect, async (req, res) => {
-  try {
-    const { topic, platform } = req.body;
-    if (!topic) return res.status(400).json({ success: false, message: 'topic is required' });
-    if (!['youtube', 'instagram', 'facebook'].includes(platform)) {
-      return res.status(400).json({ success: false, message: 'platform must be youtube, instagram, or facebook' });
-    }
-
-    await chargeDiamonds(req.user, AI_FEATURE_COST.hashtags);
-    const hashtags = await generateHashtags(topic, platform);
-    res.json({ success: true, hashtags, diamondsCharged: AI_FEATURE_COST.hashtags, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('hashtags', err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
-  }
-});
-
-router.post('/ideas', protect, async (req, res) => {
-  try {
-    const { niche, platform = 'youtube', count = 5 } = req.body;
-    if (!niche) return res.status(400).json({ success: false, message: 'niche is required' });
-
-    const ideas = await generateAiScript({ niche, platform, count });
-    res.json({ success: true, ideas, diamondsCharged: 0, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('ideas', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
+router.post('/ideas', protect, aiRoute('ideas', {
+  cost: CHARGE_IDEAS ? AI_DIAMOND_COST : 0,
+  validate: (b) => (!b.niche ? 'niche is required' : null),
+  run: async (b) => ({ ideas: await generateAiScript({ niche: b.niche, platform: b.platform || 'youtube', count: b.count || 5 }) })
+}));
 
 // @route POST /api/ai/seo-score  { title, description?, tags?, platform? }
-// Video SEO Optimizer gate: unlocks for ANY paid pack
-// (seoScoreLevel !== 'none'). tier1 (₹10) sets seoScoreLevel: 'basic' in
-// diamond.js, so ₹10 buyers already get full issues + score here. This is
-// a DIFFERENT (looser) threshold than the Channel SEO Score gate in
-// analytics.js's /audit route, which requires 'advance' (₹100+) — two
-// separate screens, two separate thresholds, both reading the same
-// seoScoreLevel field.
-router.post('/seo-score', protect, async (req, res) => {
-  try {
-    if (!hasSeoPlan(req.user)) return res.status(402).json(planUpgradeBody);
-
-    const { title, description, tags, platform = 'youtube' } = req.body;
-    if (!title) return res.status(400).json({ success: false, message: 'title is required' });
-
-    await chargeDiamonds(req.user, AI_FEATURE_COST.seoScore);
-    const result = await analyzeSeoScore({ title, description, tags, platform, mode: req.user.seoScoreLevel });
-    res.json({ success: true, ...result, seoScoreLevel: req.user.seoScoreLevel, diamondsCharged: AI_FEATURE_COST.seoScore, remainingDiamonds: req.user.diamondBalance });
-  } catch (err) {
-    logAiError('seo-score', err);
-    const status = err.code === 'INSUFFICIENT_DIAMONDS' ? 402 : 500;
-    res.status(status).json({ success: false, message: err.message });
+// Video SEO Optimizer gate: ANY paid pack (seoScoreLevel !== 'none'). Channel SEO Score in
+// analytics.js's /audit is a DIFFERENT, stricter gate ('advance').
+router.post('/seo-score', protect, aiRoute('seo-score', {
+  requirePlan: true,
+  validate: (b) => (!b.title ? 'title is required' : null),
+  run: async (b, user) => {
+    const result = await analyzeSeoScore({
+      title: b.title,
+      description: b.description,
+      tags: b.tags,
+      platform: b.platform || 'youtube',
+      mode: user.seoScoreLevel
+    });
+    return { ...result, seoScoreLevel: user.seoScoreLevel };
   }
-});
+}));
 
 // @route POST /api/ai/thumbnail-prompt  { topic }
-// Quota-based, NOT diamond-charged — each purchase sets a fixed count
-// (thumbnailPromptsRemaining) and every call here decrements it by 1 until
-// it hits 0, then the user must buy a new package to reset the quota.
+// Quota-based, NOT diamond-charged — each purchase sets a fixed count (thumbnailPromptsRemaining)
+// and every call decrements it by 1 until 0, then the user must buy a new package.
 router.post('/thumbnail-prompt', protect, async (req, res) => {
   try {
     if (req.user.thumbnailPromptsRemaining <= 0) {
@@ -235,3 +194,4 @@ router.post('/thumbnail-prompt', protect, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.AI_DIAMOND_COST = AI_DIAMOND_COST;
