@@ -7,24 +7,34 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
 const { isConfigured: payuConfigured, buildCheckoutParams, verifyPayment, revokeMandate } = require('../utils/payu');
+const { isLocked } = require('../utils/paywall');
 
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
-// The plan = UPLOAD CREDITS only (stored in user.freeUploadsRemaining, the same
-// counter the dashboard "Free Uploads  remaining / total" card already shows).
-//   Rs1 now          -> +20 uploads
-//   credits finish   -> Rs10 auto-debit (24h notice first) -> 20 uploads, new month starts that day
+// NEW PLAN (credit based):
+//   Rs1  now                      -> 20 uploads (no diamonds)
+//   upload credits reach 0        -> notice -> 24h later Rs10 auto-debit
+//                                 -> 30 uploads + 99 diamonds, valid 1 month from the day credits ran out
+// Only ONE Rs10 debit per paid month (PayU mandate rule + user safety). If the 30 uploads end mid-month the
+// user continues with diamonds; the next Rs10 notice goes out when that month is over.
+// Set SUBSCRIPTION_ALLOW_EARLY_REDEBIT=true to allow a new Rs10 debit immediately when credits end mid-month.
 // ---------------------------------------------------------------------------
 const PLAN = {
-  uploads: Number(process.env.SUBSCRIPTION_UPLOADS || 20),
+  tier: 1,
+  diamonds: 99,            // given with every Rs10 debit
+  thumbnailPrompts: 1,
+  seoScoreLevel: 'basic',
+  competitorLevel: 'none',
   introAmount: 1,
+  introUploads: 20,        // given with the Rs1 payment
   planAmount: 10,
+  planUploads: 30,         // given with every Rs10 debit
   cycleMonths: 1
 };
-// PayU billingCycle for the mandate. Debits are triggered by credits running out (not a fixed
-// date), so ADHOC fits best. If PayU does not enable ADHOC for your account use MONTHLY.
-const BILLING_CYCLE = process.env.SUBSCRIPTION_BILLING_CYCLE || 'ADHOC';
+const ALLOW_EARLY_REDEBIT = String(process.env.SUBSCRIPTION_ALLOW_EARLY_REDEBIT || '') === 'true';
+// ADHOC = PayU debits whenever WE ask (credits ended), not on a fixed calendar day. Use 'MONTHLY' to fall back.
+const BILLING_CYCLE = String(process.env.SUBSCRIPTION_BILLING_CYCLE || 'ADHOC').toUpperCase();
 const MANDATE_YEARS = Number(process.env.SUBSCRIPTION_MANDATE_YEARS || 5);
 
 const addMonths = (d, n) => {
@@ -63,10 +73,10 @@ const notify = async (user, type, title, message, pushBody) => {
   }
 };
 
-// Credits the upload pack ONCE per payment (atomic pending->approved claim).
-//  registration (Rs1): +20 uploads on top of whatever the user still has
-//  renewal (Rs10)    : top up to at least 20 (never takes credits away)
-const creditPlan = async (txn, source, isRenewal) => {
+// Credits ONCE per payment (atomic pending->approved claim).
+//   kind 'intro'   (Rs1)  -> 20 uploads
+//   kind 'monthly' (Rs10) -> 30 uploads + 99 diamonds (+ plan features)
+const creditPlan = async (txn, source, kind) => {
   const claimed = await Transaction.findOneAndUpdate(
     { _id: txn._id, status: 'pending' },
     { $set: { status: 'approved', reviewedAt: new Date(), adminNote: `Auto-approved via ${source}` } },
@@ -77,17 +87,34 @@ const creditPlan = async (txn, source, isRenewal) => {
   const user = await User.findById(claimed.user);
   if (!user) return null;
 
-  const update = isRenewal
-    ? { $max: { freeUploadsRemaining: PLAN.uploads } }
-    : { $inc: { freeUploadsRemaining: PLAN.uploads } };
+  let update;
+  let title;
+  let message;
+  let push;
+  if (kind === 'intro') {
+    update = { $inc: { freeUploadsRemaining: PLAN.introUploads } };
+    title = 'Payment successful 🎉';
+    message = `₹${claimed.amountINR} paid — ${PLAN.introUploads} uploads added to your account.`;
+    push = `${PLAN.introUploads} uploads added.`;
+  } else {
+    update = { $inc: { diamondBalance: PLAN.diamonds, freeUploadsRemaining: PLAN.planUploads } };
+    if ((user.activeTier || 0) < PLAN.tier) {
+      // never DOWNGRADE a user who already owns a bigger pack
+      update.$set = {
+        activeTier: PLAN.tier,
+        thumbnailPromptsRemaining: PLAN.thumbnailPrompts,
+        seoScoreLevel: PLAN.seoScoreLevel,
+        competitorLevel: PLAN.competitorLevel
+      };
+    } else {
+      update.$inc.thumbnailPromptsRemaining = PLAN.thumbnailPrompts;
+    }
+    title = 'Subscription payment successful 🎉';
+    message = `₹${claimed.amountINR} paid — ${PLAN.planUploads} uploads and ${PLAN.diamonds} diamonds added for 1 month.`;
+    push = `${PLAN.planUploads} uploads + ${PLAN.diamonds} diamonds added.`;
+  }
   const updated = await User.findByIdAndUpdate(user._id, update, { new: true });
-  await notify(
-    updated,
-    'payment_approved',
-    isRenewal ? 'Autopay successful 🎉' : 'Payment successful 🎉',
-    `₹${claimed.amountINR} paid — ${PLAN.uploads} uploads added. You now have ${updated.freeUploadsRemaining} uploads.`,
-    `${PLAN.uploads} uploads added to your account.`
-  );
+  await notify(updated, 'payment_approved', title, message, push);
   return { claimed, user: updated };
 };
 
@@ -107,7 +134,7 @@ const applyFailed = async (txn) => {
   }
   // a monthly autopay debit failed
   const failCount = (sub.failCount || 0) + 1;
-  const set = { failCount, lastChargeAttemptAt: new Date(), preDebitSentAt: null, debitOn: null };
+  const set = { failCount, lastChargeAttemptAt: new Date(), preDebitSentAt: null, debitOn: null, nextDebitAt: null, cycleAnchor: null };
   if (failCount >= 3) set.status = 'expired';
   await Subscription.updateOne({ _id: sub._id }, { $set: set });
   const user = await User.findById(sub.user);
@@ -117,7 +144,7 @@ const applyFailed = async (txn) => {
       'payment_failed',
       failCount >= 3 ? 'Subscription ended ❌' : 'Autopay failed ⚠️',
       failCount >= 3
-        ? 'We could not collect your ₹10 payment 3 times, so autopay has ended. You can still upload using diamonds.'
+        ? 'We could not collect your ₹10 subscription payment 3 times, so the subscription has ended.'
         : `Your ₹${PLAN.planAmount} autopay failed. We will try again soon — please keep balance in your account.`
     );
   }
@@ -142,37 +169,44 @@ const finalizeFromPayu = async (transactionId, source) => {
   if (!sub) return { state: 'pending' };
 
   if (isRegistrationTxn(sub, txn)) {
-    const now = new Date();
-    // Rs1 phase: no month yet. The month starts on the day the Rs10 is debited.
+    // Rs1 paid: mandate is registered, 20 uploads given. No fixed debit date - the Rs10 debit
+    // happens only after the upload credits reach 0 (see cron/subscriptionScheduler.js).
     await Subscription.findOneAndUpdate(
       { _id: sub._id, status: 'pending' },
       {
         $set: {
           status: 'active',
           authPayuId: String(d.mihpayid || ''),
-          firstPaidAt: now,
+          firstPaidAt: new Date(),
           currentPeriodEnd: null,
+          periodStart: null,
           nextDebitAt: null,
-          preDebitSentAt: null,
-          debitOn: null,
           failCount: 0
         }
       }
     );
-    await creditPlan(txn, source, false);
+    await creditPlan(txn, source, 'intro');
     return { state: 'approved' };
   }
 
-  // Rs10 autopay debit succeeded -> 20 uploads, and the new month starts TODAY
-  // (only the call that wins the credit claim does this)
-  const credited = await creditPlan(txn, source, true);
+  // Rs10 debit succeeded -> 30 uploads + 99 diamonds; the paid month starts on the day credits ran out.
+  const credited = await creditPlan(txn, source, 'monthly');
   if (credited) {
-    const now = new Date();
+    const anchor = sub.cycleAnchor || new Date();
     await Subscription.updateOne(
       { _id: sub._id },
       {
-        $set: { currentPeriodEnd: addMonths(now, PLAN.cycleMonths), nextDebitAt: null, lastDebitAt: now, failCount: 0, preDebitSentAt: null, debitOn: null },
-        $inc: { renewals: 1 }
+        $set: {
+          periodStart: anchor,
+          currentPeriodEnd: addMonths(anchor, PLAN.cycleMonths),
+          nextDebitAt: null,
+          lastDebitAt: new Date(),
+          failCount: 0,
+          preDebitSentAt: null,
+          debitOn: null,
+          cycleAnchor: null,
+          creditsZeroSeenAt: null
+        }
       }
     );
   }
@@ -187,12 +221,22 @@ router.get('/status', protect, async (req, res) => {
     const subs = await Subscription.find({ user: req.user._id }).sort({ createdAt: -1 }).limit(10);
     const active = subs.find((s) => s.status === 'active');
     const everPaid = subs.some((s) => !!s.firstPaidAt);
-    const shown = active || subs.find((s) => s.status === 'cancelled');
+    const shown = active || subs.find((s) => s.status === 'cancelled' && s.currentPeriodEnd && s.currentPeriodEnd > new Date());
+    // locked = has not paid anything yet (no Rs1 plan, no diamond pack) -> app locks Upload / Live / channel connect
+    const locked = await isLocked(req.user);
 
     res.json({
       success: true,
-      offer: { introAmount: PLAN.introAmount, planAmount: PLAN.planAmount, uploads: PLAN.uploads, cycle: 'monthly' },
-      uploadsLeft: Number(req.user.freeUploadsRemaining || 0),
+      locked,
+      offer: {
+        introAmount: PLAN.introAmount,
+        introUploads: PLAN.introUploads,
+        planAmount: PLAN.planAmount,
+        planUploads: PLAN.planUploads,
+        diamonds: PLAN.diamonds, // diamonds that come with the Rs10 month
+        cycle: 'monthly'
+      },
+      credits: req.user.freeUploadsRemaining || 0,
       // the Rs1 intro is for first-time subscribers only
       eligible: !active && !everPaid && payuConfigured,
       introUsed: everPaid,
@@ -201,9 +245,9 @@ router.get('/status', protect, async (req, res) => {
             id: shown._id,
             status: shown.status,
             currentPeriodEnd: shown.currentPeriodEnd,
-            // Rs10 is taken when the uploads finish (or the month ends); debitOn is set once the notice is sent
-            debitOn: shown.status === 'active' ? shown.debitOn : null,
-            renewals: shown.renewals || 0,
+            // only set while a "your credits are over" notice is pending (the Rs10 debit date)
+            nextDebitAt: shown.status === 'active' ? shown.debitOn : null,
+            periodStart: shown.periodStart,
             cancelledAt: shown.cancelledAt
           }
         : null
@@ -228,7 +272,7 @@ router.post('/start', protect, async (req, res) => {
     if (existing.some((s) => !!s.firstPaidAt)) {
       return res.status(403).json({
         success: false,
-        message: 'The ₹1 offer was already used. You can buy a diamond pack from the Subscription page.',
+        message: 'The ₹1 intro offer was already used. You can buy a diamond pack from the Subscription page.',
         code: 'INTRO_USED'
       });
     }
@@ -258,16 +302,22 @@ router.post('/start', protect, async (req, res) => {
       user: req.user._id,
       userDisplayId: userIdentifier,
       type: 'subscription_charge',
-      uploadCredits: PLAN.uploads,
+      diamondPackage: 0, // Rs1 gives uploads only
+      uploadsGranted: PLAN.introUploads,
       amountINR: PLAN.introAmount,
+      planTier: PLAN.tier,
+      thumbnailPrompts: PLAN.thumbnailPrompts,
+      seoScoreLevel: PLAN.seoScoreLevel,
+      competitorLevel: PLAN.competitorLevel,
       status: 'pending',
       paymentMethod: 'payu',
       cashfreeOrderId: txnid,
       subscription: sub._id
     });
 
-    // The Rs10 debit happens whenever the 20 uploads finish, so the mandate is valid from today.
-    const start = new Date();
+    // The Rs10 debit happens when the upload credits end (can be as early as tomorrow), so the mandate
+    // starts tomorrow and runs for MANDATE_YEARS. billingAmount is the MAX PayU may debit.
+    const start = new Date(Date.now() + 24 * 3600 * 1000);
     const end = addMonths(start, MANDATE_YEARS * 12);
     const si = {
       isFreeTrial: false,
@@ -276,13 +326,13 @@ router.post('/start', protect, async (req, res) => {
       billingCycle: BILLING_CYCLE,
       paymentStartDate: ymdIST(start),
       paymentEndDate: ymdIST(end),
-      remarks: 'TubePilot uploads plan',
+      remarks: 'TubePilot subscription',
       billingCurrency: 'INR',
       billingLimit: 'ON',
       billingRule: 'MAX'
     };
 
-    console.log(`💳 [Subscription] start — user ${req.user._id}, txnid=${txnid}, ₹${PLAN.introAmount} now (+${PLAN.uploads} uploads), then ₹${PLAN.planAmount} when the uploads finish`);
+    console.log(`💳 [Subscription] start — user ${req.user._id}, txnid=${txnid}, ₹${PLAN.introAmount} now (${PLAN.introUploads} uploads), ₹${PLAN.planAmount} when credits end, mandate from ${si.paymentStartDate}`);
     res.status(201).json({ success: true, orderId: txnid, payu, si });
   } catch (err) {
     console.error('❌ [Subscription] start failed:', err.response?.data || err.message);
@@ -335,8 +385,8 @@ router.post('/cancel', protect, async (req, res) => {
     }
     if (revoked) await Subscription.updateOne({ _id: sub._id }, { $set: { mandateRevoked: true } });
 
-    await notify(req.user, 'subscription_cancelled', 'Subscription cancelled', 'Autopay is cancelled. You will not be charged again. Your remaining uploads stay.');
-    res.json({ success: true, message: 'Autopay cancelled. You will not be charged again.', mandateRevoked: revoked });
+    await notify(req.user, 'subscription_cancelled', 'Subscription cancelled', 'Autopay is cancelled. You will not be charged again.');
+    res.json({ success: true, message: 'Subscription cancelled. You will not be charged again.', mandateRevoked: revoked });
   } catch (err) {
     console.error('❌ [Subscription] cancel failed:', err.message);
     res.status(500).json({ success: false, message: 'Could not cancel. Please try again or contact support.' });
@@ -344,6 +394,9 @@ router.post('/cancel', protect, async (req, res) => {
 });
 
 router.finalizeFromPayu = finalizeFromPayu;
+router.ALLOW_EARLY_REDEBIT = ALLOW_EARLY_REDEBIT;
+router.addMonths = addMonths;
+router.ymdIST = ymdIST;
 router.PLAN = PLAN;
 router.notify = notify;
 router.classify = classify;

@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const mongoose = require('mongoose');
 const { protect } = require('../middleware/auth');
+const { isLocked, requirePaid } = require('../utils/paywall');
 const {
   pickAvailableImageKitAccount,
   uploadBufferToImageKit,
@@ -242,7 +243,7 @@ async function ec2Request(method, path, data, timeoutMs = EC2_TIMEOUT_MS) {
 // Video ko ImageKit (dual-account) par upload karta hai, URL wapas deta hai.
 // limitGuard: live limit poori ho to upload bhi allowed nahi.
 // -----------------------------------------------------------------------
-router.post('/upload-video', protect, limitGuard, upload.single('video'), async (req, res) => {
+router.post('/upload-video', protect, requirePaid, limitGuard, upload.single('video'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'Video file zaroori hai (field name: "video").' });
@@ -431,6 +432,16 @@ router.post('/start', protect, async (req, res) => {
       return res.json({ success: true, checkOnly: true, ...limitFields(state) });
     }
 
+    // PAYWALL: ₹1 / diamond na dene wala user live start nahi kar sakta.
+    // (Upar ka __CHECK_LIMITS__ jaan-boojhkar iske PEHLE hai, taaki screen limits dikha sake.)
+    if (await isLocked(req.user)) {
+      return res.status(402).json({
+        success: false,
+        code: 'PAYMENT_REQUIRED',
+        message: 'Please activate the ₹1 plan to unlock this feature.'
+      });
+    }
+
     if (startingUsers.has(userKey)) {
       return res.status(429).json({
         success: false,
@@ -605,7 +616,7 @@ router.post('/start', protect, async (req, res) => {
 // Response mein rtmpUrl + streamKey hai — app inhi se camera stream bhejti hai.
 // Body: { title, description }
 // -----------------------------------------------------------------------
-router.post('/start-camera', protect, async (req, res) => {
+router.post('/start-camera', protect, requirePaid, async (req, res) => {
   const userKey = req.user._id.toString();
   let lockTaken = false;
 

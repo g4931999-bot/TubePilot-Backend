@@ -10,6 +10,7 @@ const {
 } = require('../utils/youtube');
 const User = require('../models/User');
 const { onChannelConnected } = require('../utils/milestones');
+const { requirePaid } = require('../utils/paywall');
 
 const router = express.Router();
 
@@ -59,7 +60,8 @@ const deriveNiche = (info) => {
   return '';
 };
 
-router.get('/oauth/url', protect, (req, res) => {
+// Not paid yet (Rs1 plan / diamond pack) -> 402 PAYMENT_REQUIRED, no channel can be connected.
+router.get('/oauth/url', protect, requirePaid, (req, res) => {
   const oauth2Client = getOAuthClient();
   const platform = req.query.platform === 'mobile' ? 'mobile' : 'web';
   const state = jwt.sign({ id: req.user._id, platform }, process.env.JWT_SECRET, { expiresIn: '10m' });

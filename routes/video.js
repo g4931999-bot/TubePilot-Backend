@@ -18,6 +18,7 @@ const {
 } = require('../utils/dateHelpers');
 
 const { getBestTimeProfile, pickAutoSlots } = require('../utils/bestTimes');
+const { requirePaid } = require('../utils/paywall');
 
 const router = express.Router();
 
@@ -130,7 +131,8 @@ const ensureFreshTokenForVideos = async (user) => {
 };
 
 // @route POST /api/videos/upload
-router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
+// requirePaid runs BEFORE multer: a user who has not paid is rejected without the file being read.
+router.post('/upload', protect, requirePaid, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
     const user = req.user;
     if (!req.files || !req.files.video) {
@@ -312,7 +314,7 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
 });
 
 // @route POST /api/videos/bulk-upload
-router.post('/bulk-upload', protect, upload.array('videos', 30), async (req, res) => {
+router.post('/bulk-upload', protect, requirePaid, upload.array('videos', 30), async (req, res) => {
   try {
     const user = req.user;
     const files = req.files;
