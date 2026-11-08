@@ -15,6 +15,7 @@ const {
   startMilestoneScheduler
 } = require('./cron/scheduler');
 const { startCompetitorSnapshotScheduler } = require('./cron/competitorScheduler');
+const { startSubscriptionScheduler } = require('./cron/subscriptionScheduler');
 
 // Core Routes Import
 const authRoutes = require('./routes/auth');
@@ -45,6 +46,7 @@ const seedAdminRoute = require('./routes/seedAdmin');
 const uploadsRoutes = require('./routes/uploads');
 const oauthRoutes = require('./routes/oauth');
 const milestoneRoutes = require('./routes/milestones');
+const subscriptionRoutes = require('./routes/subscription');
 
 const app = express();
 
@@ -171,6 +173,7 @@ app.use('/api/live-plans', livePlansRoutes);
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
+app.use('/api/subscription', subscriptionRoutes);
 
 app.use('/oauth', oauthRoutes);
 app.use('/mcp', require('./routes/mcp'));
@@ -290,10 +293,11 @@ const startServer = async () => {
       console.log(`💾 MongoDB State: ${mongoose.connection.readyState === 1 ? 'Connected' : 'Connecting...'}`);
       startPublishScheduler();
       startRetryScheduler();
-      startFreeUploadReset();
+      // startFreeUploadReset(); // OFF: free monthly uploads are closed, uploads now come from the Rs1/Rs10 plan
       startDriveAutoUploadScheduler();
       startMilestoneScheduler();
       startCompetitorSnapshotScheduler();
+      startSubscriptionScheduler();
     });
   } catch (error) {
     console.error('❌ Fatal Server Startup Error:', error.message);
