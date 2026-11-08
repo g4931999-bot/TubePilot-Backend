@@ -13,9 +13,12 @@ const TransactionSchema = new mongoose.Schema({
 
   diamondPackage: {
     type: Number,
-    enum: [0, 99, 299, 599, 799], // 0 = the Rs1 intro payment (gives uploads only, no diamonds)
-    required: function () { return this.type === 'diamond_purchase' || this.type === 'subscription_charge'; }
+    enum: [99, 299, 599, 799],
+    // not used by subscription_charge (that one grants upload credits, see uploadCredits)
+    required: function () { return this.type === 'diamond_purchase'; }
   },
+  // Upload credits granted by this payment (subscription_charge only).
+  uploadCredits: { type: Number, default: 0 },
   amountINR: {
     type: Number,
     required: function () { return ['diamond_purchase', 'live_plan_purchase', 'subscription_charge'].includes(this.type); }
@@ -30,9 +33,6 @@ const TransactionSchema = new mongoose.Schema({
   livePlanCategory: { type: String, enum: ['day', 'month'], default: null },
   livePlanName: { type: String, default: null },
   liveHoursGranted: { type: Number, default: 0 },
-
-  // Uploads granted by this payment (Rs1 intro = 20, Rs10 monthly = 30).
-  uploadsGranted: { type: Number, default: 0 },
 
   diamondsForSpend: { type: Number, default: 0 },
   relatedVideo: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null },
