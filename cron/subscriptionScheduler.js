@@ -7,60 +7,51 @@ const { isConfigured, verifyPayment, preDebitNotify, chargeRecurring, revokeMand
 const sub = require('../routes/subscription');
 
 const HOUR = 3600 * 1000;
-const MIN_NOTICE_HOURS = 25;       // 24h between notice and debit (PayU/RBI rule) + 1h safety
+const NOTICE_AT_UPLOADS = Number(process.env.SUBSCRIPTION_NOTICE_AT_UPLOADS || 3); // tell the user/bank when this many uploads are left
+const PERIOD_NOTICE_DAYS = 3;      // also notice this many days before the 1-month period ends
+const MIN_NOTICE_HOURS = 25;       // at least 24h between notice and debit (PayU/RBI rule) + safety
 const MAX_FAILS = 3;
 
 const ymdIST = (d) => new Date(new Date(d).getTime() + 5.5 * HOUR).toISOString().slice(0, 10);
 const istMidnight = (ymd) => new Date(`${ymd}T00:00:00+05:30`);
 const ok = (r) => String(r?.status) === '1';
 
-// 1) Credits ended -> notice, Rs10 debit follows ~24h later ------------------
-// Rule: when a subscriber's upload credits are 0, tell them (and PayU) that Rs10 will be debited
-// after 24 hours. The paid month starts from the day the credits ran out (cycleAnchor).
+// What makes a Rs10 renewal due for this subscription?
+//   credits finished  -> renew (debit only once credits are really 0)
+//   month ended       -> renew (same as the old monthly reset)
+const state = (s, user, now) => {
+  const credits = Number(user.freeUploadsRemaining || 0);
+  const periodEnd = s.currentPeriodEnd ? new Date(s.currentPeriodEnd) : null;
+  return {
+    credits,
+    needsNotice: credits <= NOTICE_AT_UPLOADS || (periodEnd && periodEnd <= new Date(now.getTime() + PERIOD_NOTICE_DAYS * 24 * HOUR)),
+    debitNow: credits <= 0 || (periodEnd && periodEnd <= now),
+    periodEnd
+  };
+};
+
+// 1) Notice before debit ----------------------------------------------------
 const sendPreDebitNotices = async () => {
   const now = new Date();
+  const list = await Subscription.find({
+    status: 'active',
+    preDebitSentAt: null,
+    authPayuId: { $ne: null },
+    failCount: { $lt: MAX_FAILS }
+  }).limit(500);
 
-  // a) credits came back (refund / gift) before any notice -> forget the "zero" mark
-  const marked = await Subscription.find({ status: 'active', creditsZeroSeenAt: { $ne: null }, preDebitSentAt: null }).limit(200);
-  for (const s of marked) {
-    const u = await User.findById(s.user).select('freeUploadsRemaining');
-    if (u && (u.freeUploadsRemaining || 0) > 0) {
-      await Subscription.updateOne({ _id: s._id }, { $set: { creditsZeroSeenAt: null } });
-    }
-  }
-
-  // b) active subscribers whose upload credits are 0 and who have no notice pending
-  const rows = await Subscription.aggregate([
-    {
-      $match: {
-        status: 'active',
-        preDebitSentAt: null,
-        failCount: { $lt: MAX_FAILS },
-        $or: [{ lastChargeAttemptAt: null }, { lastChargeAttemptAt: { $lt: new Date(now.getTime() - 24 * HOUR) } }]
-      }
-    },
-    { $lookup: { from: User.collection.name, localField: 'user', foreignField: '_id', as: 'u' } },
-    { $unwind: '$u' },
-    { $match: { 'u.freeUploadsRemaining': { $lte: 0 } } },
-    { $project: { _id: 1 } },
-    { $limit: 100 }
-  ]);
-
-  for (const row of rows) {
+  for (const s of list) {
     try {
-      const s = await Subscription.findById(row._id);
-      if (!s || s.status !== 'active' || s.preDebitSentAt) continue;
+      const user = await User.findById(s.user);
+      if (!user) continue;
+      const st = state(s, user, now);
+      if (!st.needsNotice) continue;
 
-      const zeroSeen = s.creditsZeroSeenAt || now;
-      if (!s.creditsZeroSeenAt) await Subscription.updateOne({ _id: s._id }, { $set: { creditsZeroSeenAt: zeroSeen } });
+      // debit date: never earlier than ~a day from now; if only the month end triggered it, not before that
+      const earliest = new Date(now.getTime() + MIN_NOTICE_HOURS * HOUR);
+      const byPeriodOnly = st.credits > NOTICE_AT_UPLOADS && st.periodEnd;
+      const debitDay = ymdIST(byPeriodOnly && st.periodEnd > earliest ? st.periodEnd : earliest);
 
-      // Only ONE Rs10 debit per paid month: if the 30 uploads ended mid-month, wait for the month to finish.
-      if (!sub.ALLOW_EARLY_REDEBIT && s.currentPeriodEnd && now < s.currentPeriodEnd) continue;
-
-      const anchor = !sub.ALLOW_EARLY_REDEBIT && s.currentPeriodEnd && s.currentPeriodEnd > zeroSeen ? s.currentPeriodEnd : zeroSeen;
-
-      // debit date = IST date of (now + 25h) => PayU's 24h notice rule always holds
-      const debitDay = ymdIST(new Date(now.getTime() + MIN_NOTICE_HOURS * HOUR));
       const r = await preDebitNotify({
         authPayuId: s.authPayuId,
         requestId: `PD${String(s._id).slice(-8)}${Date.now()}`,
@@ -72,41 +63,51 @@ const sendPreDebitNotices = async () => {
         console.warn(`⚠️ [SubScheduler] pre-debit not accepted for ${s._id}:`, JSON.stringify(r));
         continue;
       }
-      const debitOn = istMidnight(debitDay);
-      await Subscription.updateOne(
-        { _id: s._id },
-        { $set: { preDebitSentAt: now, debitOn, nextDebitAt: debitOn, cycleAnchor: anchor, creditsZeroSeenAt: zeroSeen } }
+      await Subscription.updateOne({ _id: s._id }, { $set: { preDebitSentAt: now, debitOn: istMidnight(debitDay) } });
+      await sub.notify(
+        user,
+        'subscription_predebit',
+        'Upcoming autopay',
+        `You have ${st.credits} upload(s) left. When they finish, ₹${s.planAmount} will be auto-debited (on or after ${debitDay}) for your next ${sub.PLAN.uploads} uploads. Cancel anytime in Subscription.`,
+        `₹${s.planAmount} autopay when your uploads finish. Cancel anytime in Subscription.`
       );
-      const user = await User.findById(s.user);
-      if (user) {
-        await sub.notify(
-          user,
-          'subscription_predebit',
-          'Your upload credits are over',
-          `₹${s.planAmount} will be auto-debited on ${debitDay} (after 24 hours). You will get ${sub.PLAN.planUploads} uploads + ${sub.PLAN.diamonds} diamonds for 1 month. You can cancel anytime from Subscription.`,
-          `₹${s.planAmount} autopay on ${debitDay} → ${sub.PLAN.planUploads} uploads + ${sub.PLAN.diamonds} diamonds.`
-        );
-      }
-      console.log(`📣 [SubScheduler] credits over -> pre-debit sent for ${s._id}, debit on ${debitDay}`);
+      console.log(`📣 [SubScheduler] pre-debit sent for ${s._id} (credits ${st.credits}), debit day ${debitDay}`);
     } catch (e) {
-      console.error(`❌ [SubScheduler] pre-debit failed for ${row._id}:`, e.response?.data || e.message);
+      console.error(`❌ [SubScheduler] pre-debit failed for ${s._id}:`, e.response?.data || e.message);
     }
   }
 };
 
-// 2) The monthly debit ------------------------------------------------------
+// A notice is only good for its own date. If the user did not finish the uploads in
+// time, forget it so a fresh notice (new date) goes out.
+const resetStaleNotices = async () => {
+  const r = await Subscription.updateMany(
+    { status: 'active', preDebitSentAt: { $ne: null }, debitOn: { $ne: null, $lte: new Date(Date.now() - 24 * HOUR) } },
+    { $set: { preDebitSentAt: null, debitOn: null } }
+  );
+  if (r.modifiedCount) console.log(`♻️ [SubScheduler] ${r.modifiedCount} stale pre-debit notice(s) reset`);
+};
+
+// 2) The Rs10 debit ---------------------------------------------------------
 const runDueDebits = async () => {
   const now = new Date();
   const due = await Subscription.find({
     status: 'active',
     preDebitSentAt: { $ne: null, $lte: new Date(now.getTime() - 24 * HOUR) },
-    debitOn: { $ne: null, $lte: now },
+    // only inside the notified date (debitOn .. debitOn+24h)
+    debitOn: { $ne: null, $lte: now, $gt: new Date(now.getTime() - 24 * HOUR) },
     failCount: { $lt: MAX_FAILS }
   }).limit(100);
 
   for (const s of due) {
     // one attempt per 20h
     if (s.lastChargeAttemptAt && now - s.lastChargeAttemptAt < 20 * HOUR) continue;
+
+    const user = await User.findById(s.user);
+    if (!user) continue;
+    // debit ONLY when the uploads are really finished (or the month ended)
+    if (!state(s, user, now).debitNow) continue;
+
     // claim this attempt atomically (two server instances must never both debit)
     const claimed = await Subscription.findOneAndUpdate(
       { _id: s._id, status: 'active', $or: [{ lastChargeAttemptAt: null }, { lastChargeAttemptAt: s.lastChargeAttemptAt }] },
@@ -115,18 +116,6 @@ const runDueDebits = async () => {
     );
     if (!claimed) continue;
 
-    const user = await User.findById(s.user);
-    if (!user) continue;
-
-    // Credits came back after the notice (refund / gift / admin): do NOT debit, cancel this cycle quietly.
-    if ((user.freeUploadsRemaining || 0) > 0) {
-      await Subscription.updateOne(
-        { _id: s._id },
-        { $set: { preDebitSentAt: null, debitOn: null, nextDebitAt: null, cycleAnchor: null, creditsZeroSeenAt: null, lastChargeAttemptAt: s.lastChargeAttemptAt || null } }
-      );
-      console.log(`↩️ [SubScheduler] credits back for ${s._id} — debit skipped`);
-      continue;
-    }
     const txnid = `TR${Date.now()}${crypto.randomBytes(2).toString('hex')}`;
     const identifier = String(user.userId || user._id.toString().slice(-6));
 
@@ -135,13 +124,8 @@ const runDueDebits = async () => {
         user: user._id,
         userDisplayId: identifier,
         type: 'subscription_charge',
-        diamondPackage: sub.PLAN.diamonds,
-        uploadsGranted: sub.PLAN.planUploads,
+        uploadCredits: sub.PLAN.uploads,
         amountINR: s.planAmount,
-        planTier: sub.PLAN.tier,
-        thumbnailPrompts: sub.PLAN.thumbnailPrompts,
-        seoScoreLevel: sub.PLAN.seoScoreLevel,
-        competitorLevel: sub.PLAN.competitorLevel,
         status: 'pending',
         paymentMethod: 'payu',
         cashfreeOrderId: txnid,
@@ -159,12 +143,12 @@ const runDueDebits = async () => {
       });
 
       const detail = r?.details?.[txnid];
-      const st = String(detail?.status || '').toLowerCase();
-      console.log(`💳 [SubScheduler] debit ${txnid} for ${s._id}: api=${r?.status} status=${st || '(none)'}`);
+      const stt = String(detail?.status || '').toLowerCase();
+      console.log(`💳 [SubScheduler] debit ${txnid} for ${s._id}: api=${r?.status} status=${stt || '(none)'}`);
 
-      if (st === 'captured' || st === 'success') {
+      if (stt === 'captured' || stt === 'success') {
         await sub.finalizeFromPayu((await Transaction.findOne({ cashfreeOrderId: txnid }))._id, 'autopay');
-      } else if (st === 'failed' || st === 'failure' || (r && String(r.status) === '0')) {
+      } else if (stt === 'failed' || stt === 'failure' || (r && String(r.status) === '0')) {
         await sub.applyFailed(await Transaction.findOne({ cashfreeOrderId: txnid }));
       }
       // anything else (pending / in progress): step 3 below verifies it later
@@ -216,6 +200,7 @@ const tick = async () => {
   running = true;
   try {
     await settlePending();
+    await resetStaleNotices();
     await sendPreDebitNotices();
     await runDueDebits();
     await retryRevokes();
@@ -232,7 +217,7 @@ const startSubscriptionScheduler = () => {
     return;
   }
   cron.schedule('*/30 * * * *', tick, { timezone: 'Asia/Kolkata' });
-  console.log('🔁 Subscription scheduler running (every 30 min: pre-debit notice, ₹10 debit when credits end, settle, revoke)');
+  console.log('🔁 Subscription scheduler running (every 30 min: notice at 3 uploads left, ₹10 debit when uploads finish, settle, revoke)');
 };
 
 module.exports = { startSubscriptionScheduler };
