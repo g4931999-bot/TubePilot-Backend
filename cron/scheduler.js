@@ -17,7 +17,8 @@ const {
 } = require('../utils/dateHelpers');
 
 const MilestoneTracker = require('../models/MilestoneTracker');
-const { generateMilestoneForUser } = require('../utils/milestones');
+const Milestone = require('../models/Milestone');
+const { generateMilestoneForUser, CYCLE_DAYS } = require('../utils/milestones');
 
 const MAX_RETRIES = 3;
 
@@ -694,8 +695,22 @@ const startDriveAutoUploadScheduler = () => {
 // ⚠️ NEW (Milestone feature): daily 10:00 IST check. Only users whose next
 // card is due (every 15 days) are processed; one card per user per cycle.
 // -----------------------------------------------------------------------
+// Card records are NOT kept: a card lives for 15 days (the app shows it once a day), then it is deleted.
+// Only the MilestoneTracker (last celebrated level) stays, so the same level is never celebrated twice.
+const purgeOldMilestones = async () => {
+  try {
+    const days = CYCLE_DAYS > 0 ? CYCLE_DAYS : 15;
+    const r = await Milestone.deleteMany({ createdAt: { $lt: new Date(Date.now() - days * 24 * 60 * 60 * 1000) } });
+    if (r.deletedCount > 0) console.log(`🧹 [Milestone] deleted ${r.deletedCount} expired card(s) (older than ${days} days)`);
+  } catch (err) {
+    console.error('❌ [Milestone] purge failed:', err.message);
+  }
+};
+
 const startMilestoneScheduler = () => {
+  purgeOldMilestones(); // also once on every server start
   cron.schedule(process.env.MILESTONE_CRON || '0 10 * * *', async () => {
+    await purgeOldMilestones();
     try {
       const due = await MilestoneTracker.find({ nextDueAt: { $lte: new Date() } }).limit(300);
       for (const t of due) {
