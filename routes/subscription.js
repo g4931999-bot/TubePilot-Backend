@@ -302,7 +302,7 @@ router.post('/start', protect, async (req, res) => {
       user: req.user._id,
       userDisplayId: userIdentifier,
       type: 'subscription_charge',
-      diamondPackage: 0, // Rs1 gives uploads only
+      // (no diamondPackage: the Rs1 payment gives uploads only - an old Transaction schema rejects 0 there)
       uploadsGranted: PLAN.introUploads,
       amountINR: PLAN.introAmount,
       planTier: PLAN.tier,
@@ -335,8 +335,13 @@ router.post('/start', protect, async (req, res) => {
     console.log(`💳 [Subscription] start — user ${req.user._id}, txnid=${txnid}, ₹${PLAN.introAmount} now (${PLAN.introUploads} uploads), ₹${PLAN.planAmount} when credits end, mandate from ${si.paymentStartDate}`);
     res.status(201).json({ success: true, orderId: txnid, payu, si });
   } catch (err) {
-    console.error('❌ [Subscription] start failed:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: 'Could not start the subscription. Please try again.' });
+    console.error('❌ [Subscription] start failed:', err.response?.data || err.stack || err.message);
+    // PAYU_DEBUG=1 in the server .env -> the app toast shows the REAL reason (remove it after testing).
+    const debug = process.env.PAYU_DEBUG === '1';
+    res.status(500).json({
+      success: false,
+      message: debug ? `Could not start: ${err.message}` : 'Could not start the subscription. Please try again.'
+    });
   }
 });
 
