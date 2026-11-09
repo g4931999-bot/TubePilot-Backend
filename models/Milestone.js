@@ -11,6 +11,8 @@ const MilestoneSchema = new mongoose.Schema({
   channelHandle: { type: String, default: '' },
   // NEW: channel profile photo URL (shown as avatar badge in the app card + email)
   channelThumbnail: { type: String, default: '' },
+  // IST date (YYYY-MM-DD) on which the app last showed this card -> the card is shown at most once per day
+  lastShownOn: { type: String, default: '' },
   seen: { type: Boolean, default: false, index: true },
   emailSent: { type: Boolean, default: false }
 }, { timestamps: true });
