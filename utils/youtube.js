@@ -178,7 +178,7 @@ const deleteVideoFromYoutube = async ({ accessToken, refreshToken, videoId }) =>
   await youtube.videos.delete({ id: videoId });
 };
 
-// ⚠️ NEW (Milestone feature): channel subscribers + latest video views, in 3 light list calls.
+// ⚠️ NEW (Milestone feature): channel subscribers + views of the LAST 5 videos, in 3 light list calls.
 const getMilestoneStats = async (accessToken) => {
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken });
@@ -191,24 +191,28 @@ const getMilestoneStats = async (accessToken) => {
   const st = ch.statistics || {};
   const subscribers = st.hiddenSubscriberCount ? null : Number(st.subscriberCount || 0);
 
-  let latestVideo = null;
+  let recentVideos = []; // newest first, real views straight from YouTube
   const uploads = ch.contentDetails?.relatedPlaylists?.uploads;
   if (uploads) {
-    const plRes = await youtube.playlistItems.list({ part: 'contentDetails', playlistId: uploads, maxResults: 1 });
-    const videoId = plRes.data.items?.[0]?.contentDetails?.videoId;
-    if (videoId) {
-      const vRes = await youtube.videos.list({ part: 'snippet,statistics', id: videoId });
-      const v = vRes.data.items?.[0];
-      if (v) latestVideo = { videoId, title: v.snippet?.title || '', views: Number(v.statistics?.viewCount || 0) };
+    const plRes = await youtube.playlistItems.list({ part: 'contentDetails', playlistId: uploads, maxResults: 5 });
+    const ids = (plRes.data.items || []).map((i) => i.contentDetails?.videoId).filter(Boolean);
+    if (ids.length) {
+      const vRes = await youtube.videos.list({ part: 'snippet,statistics', id: ids.join(',') });
+      const byId = {};
+      (vRes.data.items || []).forEach((v) => { byId[v.id] = v; });
+      recentVideos = ids
+        .filter((id) => byId[id])
+        .map((id) => ({ videoId: id, title: byId[id].snippet?.title || '', views: Number(byId[id].statistics?.viewCount || 0) }));
     }
   }
+  const latestVideo = recentVideos[0] || null; // kept for old callers
   // channelThumbnail is saved on the milestone so the app card + email can show the channel photo.
   const sn = ch.snippet || {};
   const channelThumbnail = sn.thumbnails?.high?.url || sn.thumbnails?.medium?.url || sn.thumbnails?.default?.url || '';
   // UPDATE25: the channel's real @handle, straight from YouTube (snippet.customUrl, e.g. "@mychannel").
   const rawHandle = (sn.customUrl || '').trim();
   const channelHandle = rawHandle ? (rawHandle.startsWith('@') ? rawHandle : `@${rawHandle}`) : '';
-  return { channelTitle: sn.title || '', channelHandle, channelThumbnail, subscribers, latestVideo };
+  return { channelTitle: sn.title || '', channelHandle, channelThumbnail, subscribers, latestVideo, recentVideos };
 };
 
 const isInvalidGrantError = (err) => {

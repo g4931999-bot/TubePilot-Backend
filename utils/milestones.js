@@ -8,9 +8,10 @@ const { sendOneSignalToUser } = require('./oneSignalPush');
 const { refreshAccessToken, getMilestoneStats, isInvalidGrantError } = require('./youtube');
 const { sendBrevoEmail } = require('./brevo');
 
+// Subscribers: 1K and up.  Views: 1M, 5M, 10M (checked on the user's LAST 5 videos).
 const MILESTONES = {
-  subscribers: [100, 500, 1000, 2000, 3000, 5000, 9000, 15000, 25000, 50000, 100000, 250000, 500000, 1000000],
-  views: [500, 1000, 2000, 5000, 10000, 25000, 50000, 100000, 250000, 500000, 1000000]
+  subscribers: [1000, 5000, 10000, 50000, 100000, 500000, 1000000],
+  views: [1000000, 5000000, 10000000]
 };
 
 // Days between two cards. Set MILESTONE_CYCLE_DAYS=0 in .env to test quickly.
@@ -135,7 +136,7 @@ const notifyUser = async (user, m) => {
   }
 };
 
-// Creates at most ONE milestone card for the user (views OR subscribers), alternating.
+// Creates at most ONE milestone card for the user: the bigger of views / subscribers.
 // Returns the Milestone doc, or null if nothing new / not due yet.
 const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
   if (!user.youtubeChannel?.refreshToken) return null;
@@ -171,12 +172,22 @@ const generateMilestoneForUser = async (user, { respectDue = true } = {}) => {
   const isFirstCheck = !tracker.initialCheckDone;
 
   const subValue = stats.subscribers != null ? highest(MILESTONES.subscribers, stats.subscribers, tracker.lastSubMilestone) : null;
-  const lv = stats.latestVideo;
-  const viewValue = lv ? highest(MILESTONES.views, lv.views, tracker.videoMilestones.get(lv.videoId) || 0) : null;
 
-  // Alternate: views first, then subscribers, then views...
-  const order = tracker.lastType === 'views' ? ['subscribers', 'views'] : ['views', 'subscribers'];
-  const pick = order.find((t) => (t === 'subscribers' ? subValue : viewValue));
+  // Views: look at the last 5 videos, keep the biggest NEW level (each video+level only once).
+  const videos = stats.recentVideos && stats.recentVideos.length ? stats.recentVideos : (stats.latestVideo ? [stats.latestVideo] : []);
+  let bestView = null; // { value, video }
+  for (const v of videos) {
+    const lvl = highest(MILESTONES.views, v.views, tracker.videoMilestones.get(v.videoId) || 0);
+    if (lvl && (!bestView || lvl > bestView.value)) bestView = { value: lvl, video: v };
+  }
+  const viewValue = bestView ? bestView.value : null;
+  const lv = bestView ? bestView.video : null;
+
+  // Both reached? Show the BIGGER one (a tie goes to subscribers). The other one comes next cycle.
+  let pick = null;
+  if (subValue && viewValue) pick = subValue >= viewValue ? 'subscribers' : 'views';
+  else if (subValue) pick = 'subscribers';
+  else if (viewValue) pick = 'views';
   tracker.initialCheckDone = true;
 
   if (!pick) {
@@ -296,4 +307,4 @@ const backfillMilestoneTrackers = async () => {
   }
 };
 
-module.exports = { generateMilestoneForUser, onChannelConnected, backfillMilestoneTrackers, MILESTONES, buildEmail, describe };
+module.exports = { generateMilestoneForUser, onChannelConnected, backfillMilestoneTrackers, MILESTONES, CYCLE_DAYS, buildEmail, describe };
