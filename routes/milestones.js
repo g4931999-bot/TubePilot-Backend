@@ -2,7 +2,7 @@ const express = require('express');
 const Milestone = require('../models/Milestone');
 const MilestoneTracker = require('../models/MilestoneTracker');
 const { protect } = require('../middleware/auth');
-const { generateMilestoneForUser, buildEmail, describe } = require('../utils/milestones');
+const { generateMilestoneForUser, buildEmail, describe, CYCLE_DAYS } = require('../utils/milestones');
 const { sendBrevoEmail } = require('../utils/brevo');
 
 // Test routes only work when MILESTONE_TEST_MODE=1 is set in .env (remove it after testing).
@@ -20,11 +20,19 @@ const handleFor = (milestone, user) => {
   return h ? (h.startsWith('@') ? h : `@${h}`) : '';
 };
 
+// A card stays "active" for 15 days after it was created (= the milestone cycle). The app shows it on
+// login / app open, at most once per day, until it expires.
+const ACTIVE_DAYS = CYCLE_DAYS > 0 ? CYCLE_DAYS : 15;
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Today's date in IST (YYYY-MM-DD) - the "once per day" rule uses it.
+const todayIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
 // @route GET /api/milestones/pending
-// Latest card the user has not seen yet (or null).
+// Latest card created in the last 15 days that was NOT already shown today (or null).
 router.get('/pending', protect, async (req, res) => {
   try {
-    const milestone = await Milestone.findOne({ user: req.user._id, seen: false }).sort({ createdAt: -1 });
+    const since = new Date(Date.now() - ACTIVE_DAYS * DAY_MS);
+    const milestone = await Milestone.findOne({ user: req.user._id, createdAt: { $gte: since }, lastShownOn: { $ne: todayIST() } }).sort({ createdAt: -1 });
     res.json({
       success: true,
       milestone: milestone
@@ -36,7 +44,8 @@ router.get('/pending', protect, async (req, res) => {
             channelTitle: milestone.channelTitle,
             channelHandle: handleFor(milestone, req.user), // UPDATE25
             channelThumbnail: milestone.channelThumbnail || '', // NEW
-            createdAt: milestone.createdAt
+            createdAt: milestone.createdAt,
+            expiresAt: new Date(new Date(milestone.createdAt).getTime() + ACTIVE_DAYS * DAY_MS)
           }
         : null
     });
@@ -46,10 +55,10 @@ router.get('/pending', protect, async (req, res) => {
 });
 
 // @route POST /api/milestones/:id/seen
-// Marks this card (and any older unseen ones) as seen, so a milestone never pops up twice.
+// Called when the card is shown: remembers "shown today", so it comes back tomorrow (until it expires).
 router.post('/:id/seen', protect, async (req, res) => {
   try {
-    await Milestone.updateMany({ user: req.user._id, seen: false }, { $set: { seen: true } });
+    await Milestone.updateOne({ _id: req.params.id, user: req.user._id }, { $set: { seen: true, lastShownOn: todayIST() } });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
