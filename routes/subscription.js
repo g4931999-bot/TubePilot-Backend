@@ -91,7 +91,8 @@ const creditPlan = async (txn, source, kind) => {
   let message;
   let push;
   if (kind === 'intro') {
-    update = { $inc: { freeUploadsRemaining: PLAN.introUploads } };
+    // exactly the intro uploads: a new account may already hold a default free grant, so never 20 + 20
+    update = { $set: { freeUploadsRemaining: Math.max(PLAN.introUploads, 0) } };
     title = 'Payment successful 🎉';
     message = `₹${claimed.amountINR} paid — ${PLAN.introUploads} uploads added to your account.`;
     push = `${PLAN.introUploads} uploads added.`;
