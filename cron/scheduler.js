@@ -463,7 +463,9 @@ const startFreeUploadReset = () => {
     try {
       const now = new Date();
       const dueUsers = await User.find({ freeUploadsResetAt: { $lte: now } });
-      const freeLimit = Number(process.env.FREE_UPLOADS_PER_MONTH || 20);
+      // NEW MODEL: free uploads are given ONCE at sign-up (3), not every month. Set FREE_UPLOADS_PER_MONTH>0 to bring the monthly refill back.
+      const freeLimit = Number(process.env.FREE_UPLOADS_PER_MONTH || 0);
+      if (freeLimit <= 0) return;
       for (const user of dueUsers) {
         user.freeUploadsRemaining = freeLimit;
         user.freeUploadsResetAt = new Date(new Date().setMonth(new Date().getMonth() + 1));
