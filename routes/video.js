@@ -19,6 +19,7 @@ const {
 
 const { getBestTimeProfile, pickAutoSlots } = require('../utils/bestTimes');
 const { requirePaid } = require('../utils/paywall');
+const { analyzeVideo } = require('../utils/videoAnalyzer');
 
 const router = express.Router();
 
@@ -39,6 +40,62 @@ const chargeForUpload = (user) => {
   const err = new Error('Not enough diamonds. Please buy more diamonds to upload.');
   err.code = 'INSUFFICIENT_DIAMONDS';
   throw err;
+};
+
+// AUTO TITLE / DESCRIPTION / TAGS: runs in the background right after the upload (the video is always
+// scheduled at least 1 hour ahead, so it is ready long before publishing). Fills ONLY what the user left empty.
+const autoFillMeta = async (videoId, user, fallbackTitle) => {
+  try {
+    const video = await Video.findById(videoId);
+    if (!video) return;
+    const yt = video.platforms.find((p) => p.platform === 'youtube');
+    const needs = video.platforms.some((p) =>
+      p.platform === 'youtube'
+        ? !p.title || p.title === fallbackTitle || !p.description || !(p.tags || []).length
+        : !p.caption || !(p.hashtags || []).length
+    );
+    if (!needs) return;
+
+    const past = await Video.find({ user: user._id, _id: { $ne: video._id }, 'platforms.platform': 'youtube' })
+      .sort({ createdAt: -1 }).limit(6).lean();
+    const recentTitles = past.map((v) => (v.platforms.find((p) => p.platform === 'youtube') || {}).title).filter(Boolean);
+
+    const meta = await analyzeVideo({
+      storageUrl: video.storageUrl || video.videoUrl,
+      fileName: fallbackTitle,
+      channelName: (user.youtubeChannel && user.youtubeChannel.channelTitle) || '',
+      recentTitles
+    });
+    if (!meta) {
+      console.log(`ℹ️ [AutoMeta] no result for video ${video._id} (kept what the user typed)`);
+      return;
+    }
+
+    for (const p of video.platforms) {
+      const set = {};
+      if (p.platform === 'youtube') {
+        if (!p.title || p.title === fallbackTitle) set['platforms.$.title'] = meta.title;
+        if (!p.description) set['platforms.$.description'] = meta.description;
+        if (!(p.tags || []).length) set['platforms.$.tags'] = meta.tags;
+      } else {
+        if (!p.caption) set['platforms.$.caption'] = meta.description.split('\n').slice(0, 3).join('\n');
+        if (!(p.hashtags || []).length) set['platforms.$.hashtags'] = meta.tags.slice(0, 8).map((t) => `#${t.replace(/\s+/g, '')}`);
+      }
+      if (Object.keys(set).length) {
+        await Video.updateOne({ _id: video._id, 'platforms._id': p._id }, { $set: set });
+      }
+    }
+    console.log(`✨ [AutoMeta] video ${video._id}: "${meta.title}"`);
+  } catch (e) {
+    console.error('⚠️ [AutoMeta] failed:', e.message);
+  }
+};
+
+// Poster frame of a stored Cloudinary video (1st second) - used when no thumbnail was uploaded.
+const posterFromVideoUrl = (url) => {
+  const u = String(url || '');
+  if (!u.includes('/video/upload/')) return '';
+  return u.replace('/video/upload/', '/video/upload/so_1,w_720,c_limit,f_jpg/').replace(/\.[a-z0-9]+(\?.*)?$/i, '.jpg');
 };
 
 const storeVideoFile = async (buffer, filename, mimetype) => {
@@ -225,6 +282,7 @@ router.post('/upload', protect, requirePaid, upload.fields([{ name: 'video', max
     }
 
     const mediaUrlsRequested = parseJson(req.body.mediaUrls, [stored.storageUrl]);
+    const autoFallbackTitle = String(videoFile.originalname || 'My video').replace(/\.[^.]+$/, '').slice(0, 90) || 'My video';
 
     const platforms = [];
     for (const p of platformsRequested) {
@@ -236,7 +294,7 @@ router.post('/upload', protect, requirePaid, upload.fields([{ name: 'video', max
           postType: 'video',
           status: 'queued',
           scheduledAt,
-          title: yt.title || '',
+          title: yt.title || autoFallbackTitle,
           description: yt.description || '',
           tags: parseCommaList(yt.tags),
           category: yt.category || '22',
@@ -293,7 +351,9 @@ router.post('/upload', protect, requirePaid, upload.fields([{ name: 'video', max
     user.storageUsedBytes += videoFile.size;
     await user.save();
 
-    res.status(201).json({ success: true, video, autoSlotted: !!autoSlotAt, autoSlotAt });
+    setImmediate(() => autoFillMeta(video._id, user, autoFallbackTitle));
+
+    res.status(201).json({ success: true, video, posterUrl: posterFromVideoUrl(stored.storageUrl), autoSlotted: !!autoSlotAt, autoSlotAt });
   } catch (err) {
     if (err.code === 'INSUFFICIENT_DIAMONDS') {
       sendOneSignalToUser(req.user, {
@@ -443,6 +503,8 @@ router.post('/bulk-upload', protect, requirePaid, upload.array('videos', 30), as
         user.storageUsedBytes += file.size;
         await user.save();
 
+        setImmediate(() => autoFillMeta(video._id, user, meta.title || file.originalname || `Video ${i + 1}`));
+
         results.push({
           success: true,
           fileName: file.originalname,
@@ -514,7 +576,8 @@ router.get('/library', protect, async (req, res) => {
         title: liveMatch?.title || ytTarget?.title || '',
         description: liveMatch?.description || ytTarget?.description || '',
         tags: liveMatch?.tags || ytTarget?.tags || [],
-        thumbnail: liveMatch?.thumbnail || ytTarget?.thumbnailUrl || '',
+        thumbnail: liveMatch?.thumbnail || ytTarget?.thumbnailUrl || posterFromVideoUrl(video.storageUrl || video.videoUrl),
+        posterUrl: posterFromVideoUrl(video.storageUrl || video.videoUrl),
         status: video.status,
         // UPDATE22: REAL numbers from YouTube only (null when the video is not live on YouTube yet)
         viewCount: liveMatch && liveMatch.viewCount != null ? liveMatch.viewCount : null,

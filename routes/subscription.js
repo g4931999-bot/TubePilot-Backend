@@ -246,9 +246,9 @@ router.get('/status', protect, async (req, res) => {
       },
       credits: req.user.freeUploadsRemaining || 0,
       // the Rs1 intro is for first-time buyers only
-      eligible: !everPaid && payuConfigured,
+      eligible: process.env.PAYWALL_ENABLED === 'true' && !everPaid && payuConfigured,
       // Rs1 already used -> the next purchase is the one-time Rs10 month
-      planEligible: everPaid && payuConfigured,
+      planEligible: payuConfigured && (process.env.PAYWALL_ENABLED === 'true' ? everPaid : true),
       introUsed: everPaid,
       autopay: false,
       planExpiresAt,
@@ -270,7 +270,8 @@ router.post('/start', protect, async (req, res) => {
 
     const existing = await Subscription.find({ user: req.user._id }).sort({ createdAt: -1 });
     // first payment = Rs1 (20 uploads); every later payment = one-time Rs10 month (30 uploads + 99 diamonds)
-    const monthly = existing.some((s) => !!s.firstPaidAt);
+    // NEW MODEL (PAYWALL_ENABLED not true): there is no Rs1 step - the only payment is the one-time Rs10 month
+    const monthly = process.env.PAYWALL_ENABLED === 'true' ? existing.some((s) => !!s.firstPaidAt) : true;
 
     const userIdentifier = String(req.user.userId || req.user._id.toString().slice(-6));
     const txnid = `${monthly ? 'TM' : 'TS'}${Date.now()}${crypto.randomBytes(2).toString('hex')}`;

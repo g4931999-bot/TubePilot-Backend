@@ -52,7 +52,7 @@ router.post('/signup', async (req, res) => {
       authProvider: 'local',
       referralCode,
       referredBy: referredBy || null,
-      freeUploadsRemaining: Number(process.env.FREE_UPLOADS_PER_MONTH || 20)
+      freeUploadsRemaining: Number(process.env.SIGNUP_FREE_UPLOADS || 3) // new model: 3 free uploads, once
     });
 
     const { accessToken, refreshToken } = await issueTokens(res, user);
@@ -110,7 +110,7 @@ router.post('/google', async (req, res) => {
         googleId: payload.sub,
         authProvider: 'google',
         referralCode,
-        freeUploadsRemaining: Number(process.env.FREE_UPLOADS_PER_MONTH || 20)
+        freeUploadsRemaining: Number(process.env.SIGNUP_FREE_UPLOADS || 3) // new model: 3 free uploads, once
       });
     } else if (!user.googleId) {
       user.googleId = payload.sub;
