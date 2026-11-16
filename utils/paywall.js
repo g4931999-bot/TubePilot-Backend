@@ -32,7 +32,12 @@ const hasPaid = async (user) => {
   return !!txn;
 };
 
+// NEW MODEL: no up-front payment. New accounts get 3 free uploads, then the one-time Rs10 plan is offered.
+// The old "Rs1 or locked" behaviour only runs when PAYWALL_ENABLED=true is set in the server env.
+const PAYWALL_ENABLED = () => process.env.PAYWALL_ENABLED === 'true';
+
 const isLocked = async (user) => {
+  if (!PAYWALL_ENABLED()) return false;
   if (!payuConfigured) return false;
   return !(await hasPaid(user));
 };
@@ -54,4 +59,4 @@ const requirePaid = async (req, res, next) => {
   }
 };
 
-module.exports = { hasPaid, isLocked, requirePaid };
+module.exports = { hasPaid, isLocked, requirePaid, PAYWALL_ENABLED };
