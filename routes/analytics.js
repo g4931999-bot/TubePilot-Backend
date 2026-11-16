@@ -3,7 +3,7 @@ const { protect } = require('../middleware/auth');
 const Video = require('../models/Video');
 const Competitor = require('../models/Competitor');
 const { refreshAccessToken, isInvalidGrantError } = require('../utils/youtube');
-const { fetchCompetitorStats, getYoutubeClient } = require('../utils/youtubePublic');
+const { fetchCompetitorStats, getYoutubeClient, markQuotaIfExceeded } = require('../utils/youtubePublic');
 const mongoose = require('mongoose');
 const CompetitorVideo = require('../models/CompetitorVideo');
 const CompetitorVideoSnapshot = require('../models/CompetitorVideoSnapshot');
@@ -95,14 +95,17 @@ const shapeCompetitor = (c, advanced) => {
 // Search typeahead: search.list costs 100 YouTube quota units per call, so
 // identical queries are served from a short in-memory cache.
 const searchCache = new Map();
-const SEARCH_TTL_MS = 10 * 60 * 1000;
+const SEARCH_TTL_MS = 24 * 60 * 60 * 1000;
+// per-user limit: search.list costs 100 units, so max 15 searches / hour / user
+const searchUse = new Map();
+const SEARCH_PER_HOUR = 15;
 const SEARCH_CACHE_MAX = 500;
 
 // @route GET /api/analytics/competitors/search?q=tube
 router.get('/competitors/search', protect, async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
-    if (q.length < 2) return res.json({ success: true, results: [] });
+    if (q.length < 3) return res.json({ success: true, results: [] });
 
     const apiKey = process.env.YOUTUBE_DATA_API_KEY;
     if (!apiKey) {
@@ -115,7 +118,16 @@ router.get('/competitors/search', protect, async (req, res) => {
       return res.json({ success: true, results: hit.results, cached: true });
     }
 
-    const youtube = google.youtube({ version: 'v3', auth: apiKey });
+    const uid = String(req.user._id);
+    const nowMs = Date.now();
+    const used = (searchUse.get(uid) || []).filter((t) => nowMs - t < 3600000);
+    if (used.length >= SEARCH_PER_HOUR) {
+      return res.status(429).json({ success: false, message: 'Too many searches. Please wait a bit, or add the channel using its @handle / link.' });
+    }
+    used.push(nowMs);
+    searchUse.set(uid, used);
+
+    const youtube = getYoutubeClient();
     const searchRes = await youtube.search.list({
       part: 'snippet',
       type: 'channel',
@@ -135,7 +147,9 @@ router.get('/competitors/search', protect, async (req, res) => {
 
     res.json({ success: true, results });
   } catch (err) {
+    const e = markQuotaIfExceeded(err);
     console.error('❌ [Competitor Search] failed:', err.response?.data || err.message);
+    if (e.code === 'YOUTUBE_QUOTA_EXCEEDED') return res.status(503).json({ success: false, message: e.message });
     res.status(500).json({ success: false, message: 'Search failed. Please try again.' });
   }
 });
@@ -147,11 +161,15 @@ const loadCompetitorsFresh = async (user) => {
     competitors.map(async (c) => {
       const isStale = !c.lastStats?.fetchedAt || Date.now() - new Date(c.lastStats.fetchedAt).getTime() > STALE_STATS_MS;
       if (!isStale) return;
+      // A failed fetch is retried only after 3 hours (was: on every page open).
+      const errAt = c.lastStats?.errorAt ? new Date(c.lastStats.errorAt).getTime() : 0;
+      if (errAt && Date.now() - errAt < 3 * 60 * 60 * 1000) return;
       try {
         c.lastStats = await fetchCompetitorStats({ channelId: c.channelId, handle: c.handle, mode: normalizeLevel(user.competitorLevel) });
         await c.save();
       } catch (err) {
-        c.lastStats = { ...(c.lastStats?.toObject ? c.lastStats.toObject() : c.lastStats), error: err.message, fetchedAt: c.lastStats?.fetchedAt || null };
+        const e = markQuotaIfExceeded(err);
+        c.lastStats = { ...(c.lastStats?.toObject ? c.lastStats.toObject() : c.lastStats), error: e.message, errorAt: new Date(), fetchedAt: c.lastStats?.fetchedAt || null };
         await c.save();
       }
     })
@@ -233,7 +251,8 @@ router.post('/competitors', protect, async (req, res) => {
         await Competitor.deleteOne({ _id: competitor._id });
         return res.status(404).json({ success: false, message: err.message });
       }
-      competitor.lastStats = { error: err.message, fetchedAt: null };
+      const e = markQuotaIfExceeded(err);
+      competitor.lastStats = { error: e.message, errorAt: new Date(), fetchedAt: null };
       await competitor.save();
     }
 
@@ -700,7 +719,7 @@ router.get('/audit', protect, async (req, res) => {
     // users. Channel SEO Score requires 'advance' specifically (₹100+),
     // NOT just any non-'none' value — this is what makes it stricter than
     // Video SEO Optimizer's gate in routes/ai.js.
-    const channelSeoUnlocked = req.user.seoScoreLevel === 'advance';
+    const channelSeoUnlocked = true; // Channel audit is free for everyone
 
     // Full audit report (health score + the 5 cards). Built from real API data only.
     const parseIso = (iso) => {
