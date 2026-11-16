@@ -9,7 +9,7 @@ const Competitor = require('../models/Competitor');
 const CompetitorVideo = require('../models/CompetitorVideo');
 const CompetitorVideoSnapshot = require('../models/CompetitorVideoSnapshot');
 const CompetitorChannelSnapshot = require('../models/CompetitorChannelSnapshot');
-const { getYoutubeClient } = require('./youtubePublic');
+const { getYoutubeClient, markQuotaIfExceeded } = require('./youtubePublic');
 
 const HOUR = 60 * 60 * 1000;
 const IST_OFFSET_MS = 5.5 * HOUR;
@@ -60,7 +60,10 @@ const ingestChannels = async (channelIds, { maxVideos = 30 } = {}) => {
   const result = { channels: 0, videos: 0, errors: [] };
   if (ids.length === 0) return result;
 
-  const youtube = getYoutubeClient();
+  let youtube;
+  try { youtube = getYoutubeClient(); } catch (e) { result.errors.push(e.message); return result; }
+  let quotaHit = false;
+  const stopOnQuota = (err) => { const e = markQuotaIfExceeded(err); if (e.code === 'YOUTUBE_QUOTA_EXCEEDED') quotaHit = true; return e.message; };
   const now = new Date();
   const day = istDayKey(now);
 
@@ -87,13 +90,15 @@ const ingestChannels = async (channelIds, { maxVideos = 30 } = {}) => {
         result.channels += ops.length;
       }
     } catch (err) {
-      result.errors.push(`channels.list: ${err.message}`);
+      result.errors.push(`channels.list: ${stopOnQuota(err)}`);
+      if (quotaHit) return result;
     }
   }
 
   // 2) Latest upload IDs per channel (small concurrency to stay polite).
   const allVideoIds = [];
   for (const group of chunk(ids, 5)) {
+    if (quotaHit) return result;
     await Promise.all(group.map(async (channelId) => {
       try {
         const res = await youtube.playlistItems.list({
@@ -105,13 +110,14 @@ const ingestChannels = async (channelIds, { maxVideos = 30 } = {}) => {
           if (i.contentDetails?.videoId) allVideoIds.push(i.contentDetails.videoId);
         });
       } catch (err) {
-        result.errors.push(`${channelId}: ${err.message}`);
+        result.errors.push(`${channelId}: ${stopOnQuota(err)}`);
       }
     }));
   }
 
   // 3) Video details + statistics (batched, 50 videos per call).
   for (const batch of chunk([...new Set(allVideoIds)], 50)) {
+    if (quotaHit) break;
     try {
       const res = await youtube.videos.list({ part: 'snippet,statistics,contentDetails', id: batch.join(','), maxResults: 50 });
       const videoOps = [];
@@ -159,7 +165,7 @@ const ingestChannels = async (channelIds, { maxVideos = 30 } = {}) => {
         result.videos += videoOps.length;
       }
     } catch (err) {
-      result.errors.push(`videos.list: ${err.message}`);
+      result.errors.push(`videos.list: ${stopOnQuota(err)}`);
     }
   }
 
@@ -218,6 +224,7 @@ const runDailyCompetitorSnapshot = async () => {
 
   for (const group of chunk(ids, 100)) {
     const r = await ingestChannels(group);
+    if (r.errors.some((m) => /daily limit reached/i.test(m))) { total.errors.push(...r.errors); break; }
     total.channels += r.channels;
     total.videos += r.videos;
     total.errors.push(...r.errors);
