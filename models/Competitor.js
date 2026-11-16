@@ -18,7 +18,8 @@ const CompetitorSchema = new mongoose.Schema({
     // the core "is this competitor trending up" signal VidIQ surfaces.
     vph: { type: Number, default: null },
     fetchedAt: { type: Date, default: null },
-    error: { type: String, default: null } // set when the last refresh failed (e.g. no API key configured)
+    error: { type: String, default: null }, // set when the last refresh failed (e.g. no API key configured)
+    errorAt: { type: Date, default: null }  // when the last refresh failed (retry only after 3h)
   }
 }, { timestamps: true });
 
