@@ -71,8 +71,9 @@ router.post('/understand', protect, async (req, res) => {
       `You are the assistant inside TubePilot (a YouTube upload/scheduling/SEO app). The user writes Hindi/Hinglish/English. ` +
       `Current time: ${istNowText()}. Conversation stage: "${stage}". Videos attached in chat: ${videoCount}.\n` +
       `Classify the user's message. Return ONLY JSON: {"intent": one of ${JSON.stringify(INTENTS)}, "reply": "one short friendly Hinglish line (max 25 words)", ` +
-      `"hint": string|null, "skip": boolean, "now": boolean, "scheduleIso": string|null, "handle": string|null, "bulkAuto": boolean}\n` +
+      `"auto": boolean, "hint": string|null, "skip": boolean, "now": boolean, "scheduleIso": string|null, "handle": string|null, "bulkAuto": boolean}\n` +
       `Rules:\n` +
+      `- "auto": true ONLY if the user says to do it without approval / automatically / on its own ("bina approval ke", "automatic upload karo", "approval ki zarurat nahi"), else false.\n` +
       `- "upload": wants to upload / set up / schedule video(s), or says they will send videos.\n` +
       `- stage "ask_hint": the user is describing what the video is about -> intent "hint", hint = their description (copy their words). If they say they don't know / "tum dekh lo" / "auto" -> intent "hint", skip=true, hint=null.\n` +
       `- stage "ask_thumb": if they say no/skip/auto/baad me -> intent "thumbnail", skip=true. If they only talk about something else classify normally.\n` +
@@ -101,6 +102,7 @@ router.post('/understand', protect, async (req, res) => {
       skip: !!out.skip,
       now: !!out.now,
       bulkAuto: !!out.bulkAuto,
+      auto: !!out.auto,
       scheduleIso,
       handle: out.handle ? String(out.handle).trim().slice(0, 200) : null
     });
