@@ -47,6 +47,7 @@ const uploadsRoutes = require('./routes/uploads');
 const oauthRoutes = require('./routes/oauth');
 const milestoneRoutes = require('./routes/milestones');
 const subscriptionRoutes = require('./routes/subscription');
+const assistantRoutes = require('./routes/assistant'); // AI chat (swipe-right chat screen)
 
 const app = express();
 
@@ -183,6 +184,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/assistant', assistantRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/milestones', milestoneRoutes);
 app.use('/api/seed-admin', seedAdminRoute);
