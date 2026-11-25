@@ -11,6 +11,7 @@
 // Never throws: returns null when anything fails, so an upload is never broken by this.
 // ---------------------------------------------------------------------------
 const axios = require('axios');
+const { visionModels } = require('./groqModels');
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MODEL = () => process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
@@ -70,10 +71,11 @@ const clean = (obj) => {
   return { title, description, tags: out };
 };
 
+let discoveredVision = null; // a vision model this key really has (used after a "model_not_found")
 const callGroq = async (messages, key) => {
   const r = await axios.post(
     GROQ_URL,
-    { model: MODEL(), messages, temperature: 0.6, max_tokens: 900, response_format: { type: 'json_object' } },
+    { model: discoveredVision || MODEL(), messages, temperature: 0.6, max_tokens: 900, response_format: { type: 'json_object' } },
     { headers: { Authorization: `Bearer ${key}` }, timeout: 30000 }
   );
   return r.data?.choices?.[0]?.message?.content || '';
@@ -115,6 +117,9 @@ const analyzeVideo = (p) =>
         } catch (e) {
           const status = e.response?.status;
           console.error(`⚠️ [VideoAnalyzer] Groq ${status || ''} ${e.response?.data?.error?.message || e.message}`);
+          if (e.response?.data?.error?.code === 'model_not_found') {
+            try { discoveredVision = (await visionModels(key))[0] || null; } catch (_) { /* ignore */ }
+          }
           if (status === 429) await new Promise((r) => setTimeout(r, 3000)); // rate limit: next key / retry
         }
       }
