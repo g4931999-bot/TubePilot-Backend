@@ -13,6 +13,7 @@
 const express = require('express');
 const axios = require('axios');
 const { protect } = require('../middleware/auth');
+const { chatModels } = require('../utils/groqModels');
 
 const router = express.Router();
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
@@ -22,7 +23,8 @@ const keys = () => [process.env.GROQ_API_KEY_1, process.env.GROQ_API_KEY, proces
 const IST_MS = 5.5 * 60 * 60 * 1000;
 
 // models are tried in this order (first one that works wins); set GROQ_CHAT_MODEL to put yours first
-const models = () => [...new Set([process.env.GROQ_CHAT_MODEL, 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-20b'].filter(Boolean))];
+let lastGoodModel = null; // remembered so the next message goes straight to a working model
+const models = () => [...new Set([lastGoodModel, process.env.GROQ_CHAT_MODEL, 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-20b'].filter(Boolean))];
 
 const askJson = async (system, user, maxTokens = 700) => {
   const apiKeys = keys();
@@ -32,7 +34,13 @@ const askJson = async (system, user, maxTokens = 700) => {
     throw e;
   }
   let lastErr;
-  for (const model of models()) {
+  // our default list first; if Groq says a model does not exist, the models this key really has are tried too
+  const tried = new Set();
+  const order = models();
+  for (let m = 0; m < order.length; m += 1) {
+    const model = order[m];
+    if (tried.has(model)) continue;
+    tried.add(model);
     for (const key of apiKeys) {
       try {
         const r = await axios.post(
@@ -46,6 +54,7 @@ const askJson = async (system, user, maxTokens = 700) => {
           },
           { headers: { Authorization: `Bearer ${key}` }, timeout: 30000 }
         );
+        lastGoodModel = model;
         return JSON.parse(r.data?.choices?.[0]?.message?.content || '{}');
       } catch (e) {
         lastErr = e;
@@ -53,6 +62,12 @@ const askJson = async (system, user, maxTokens = 700) => {
         console.error(`⚠️ [Assistant] Groq ${model} -> ${st || ''} ${e.response?.data?.error?.message || e.message}`);
         lastErr.detail = `${model}: ${st || ''} ${e.response?.data?.error?.message || e.message}`.slice(0, 200);
         if (st === 429) await new Promise((r2) => setTimeout(r2, 1500));
+        if (e.response?.data?.error?.code === 'model_not_found' && !order.discovered) {
+          order.discovered = true;
+          try {
+            (await chatModels(key)).forEach((id) => { if (!order.includes(id)) order.push(id); });
+          } catch (_) { /* keep going with the list we have */ }
+        }
       }
     }
   }
