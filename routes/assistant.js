@@ -21,17 +21,24 @@ const LANGUAGE = () => process.env.AUTO_META_LANGUAGE || 'Hinglish';
 const keys = () => [process.env.GROQ_API_KEY_1, process.env.GROQ_API_KEY, process.env.GROQ_API_KEY_2].filter(Boolean);
 const IST_MS = 5.5 * 60 * 60 * 1000;
 
+// models are tried in this order (first one that works wins); set GROQ_CHAT_MODEL to put yours first
+const models = () => [...new Set([process.env.GROQ_CHAT_MODEL, 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-20b'].filter(Boolean))];
+
 const askJson = async (system, user, maxTokens = 700) => {
   const apiKeys = keys();
-  if (!apiKeys.length) throw new Error('AI is not configured on the server.');
+  if (!apiKeys.length) {
+    const e = new Error('AI keys are not set on the server (GROQ_API_KEY_1 / GROQ_API_KEY).');
+    e.detail = e.message;
+    throw e;
+  }
   let lastErr;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (const model of models()) {
     for (const key of apiKeys) {
       try {
         const r = await axios.post(
           GROQ_URL,
           {
-            model: MODEL(),
+            model,
             messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
             temperature: 0.4,
             max_tokens: maxTokens,
@@ -42,7 +49,10 @@ const askJson = async (system, user, maxTokens = 700) => {
         return JSON.parse(r.data?.choices?.[0]?.message?.content || '{}');
       } catch (e) {
         lastErr = e;
-        if (e.response?.status === 429) await new Promise((r2) => setTimeout(r2, 2000));
+        const st = e.response?.status;
+        console.error(`⚠️ [Assistant] Groq ${model} -> ${st || ''} ${e.response?.data?.error?.message || e.message}`);
+        lastErr.detail = `${model}: ${st || ''} ${e.response?.data?.error?.message || e.message}`.slice(0, 200);
+        if (st === 429) await new Promise((r2) => setTimeout(r2, 1500));
       }
     }
   }
@@ -108,7 +118,7 @@ router.post('/understand', protect, async (req, res) => {
     });
   } catch (err) {
     console.error('❌ [Assistant] understand:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: 'AI is busy right now. Please try again.' });
+    res.status(500).json({ success: false, message: 'AI is busy right now. Please try again.', detail: err.detail || err.message });
   }
 });
 
@@ -144,7 +154,7 @@ router.post('/meta', protect, async (req, res) => {
     res.json({ success: true, items });
   } catch (err) {
     console.error('❌ [Assistant] meta:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: 'AI is busy right now. Please try again.' });
+    res.status(500).json({ success: false, message: 'AI is busy right now. Please try again.', detail: err.detail || err.message });
   }
 });
 
