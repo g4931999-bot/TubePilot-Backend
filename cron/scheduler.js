@@ -352,6 +352,9 @@ const processVideoTargets = async (video) => {
 // Promotes YouTube targets that were uploaded early as 'unlisted' to their
 // real target privacy (usually 'public') the moment scheduledAt arrives.
 // -----------------------------------------------------------------------
+const promoteBackoff = new Map(); // videoId -> next try (ms): a failing video is retried every 15 min, not every minute
+const PROMOTE_RETRY_MS = 15 * 60 * 1000;
+
 const promoteScheduledYouTubeVideos = async () => {
   const now = new Date();
   const dueVideos = await Video.find({
@@ -366,6 +369,14 @@ const promoteScheduledYouTubeVideos = async () => {
       (t) => t.platform === 'youtube' && t.status === 'uploaded' && !t.youtubePrivacyPromoted && t.scheduledAt && t.scheduledAt <= now
     );
     if (!target) continue;
+    if ((promoteBackoff.get(String(video._id)) || 0) > Date.now()) continue;
+
+    // already at the wanted privacy (e.g. unlisted -> unlisted): nothing to call, saves YouTube quota
+    if (target.privacyStatus && target.privacyStatus === (target.targetPrivacyStatus || 'public')) {
+      target.youtubePrivacyPromoted = true;
+      await video.save();
+      continue;
+    }
 
     try {
       const user = await User.findById(video.user);
@@ -406,6 +417,16 @@ const promoteScheduledYouTubeVideos = async () => {
       await cleanupMcpVideoIfDone(video);
     } catch (err) {
       console.error(`❌ [Scheduler] Video ${video._id} / youtube: privacy promotion failed — ${err.message}`);
+      if (/cannot be found|videoNotFound|not found/i.test(String(err.message))) {
+        // the video no longer exists on YouTube (deleted by the user): stop trying for ever
+        try {
+          target.youtubePrivacyPromoted = true;
+          await video.save();
+          console.warn(`⚠️ [Scheduler] Video ${video._id}: not on YouTube any more - promotion stopped`);
+        } catch (_) { /* ignore */ }
+      } else {
+        promoteBackoff.set(String(video._id), Date.now() + PROMOTE_RETRY_MS);
+      }
     }
   }
 };
